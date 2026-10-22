@@ -417,6 +417,145 @@ def test_event_count_never_exceeds_the_plugin_limit(tmp_path):
     assert len(evs) <= hb.EVENT_LIMIT and data['state'] == 'completed'
 
 
+def test_longest_completion_summary_still_fits_the_plugin_event_limit(tmp_path):
+    b = make(tmp_path)
+    t = start(b, 1, topic='很' * 200)   # topic names are cut to 40 characters
+    report(b, t, 'STATUS: done\n' + '报告正文' * 5000)
+    b.observe_all()
+    data, evs = events(b, t)   # plugin_accepts: json.dumps(event) <= 20000
+    assert data['state'] == 'completed' and '报告正文' * (hb.SUMMARY_CHARS // 4) in evs[-1]['summary']
+
+
+# ---- reading the task directory ----
+
+def write(b, task_id, rel, data):
+    p = Path(b.task(task_id)['task_dir'], rel)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data.encode() if isinstance(data, str) else data)
+    return p
+
+
+def test_read_defaults_to_the_report_and_reads_artifacts_and_lists_the_directory(tmp_path):
+    b = make(tmp_path)
+    t = start(b, 1)
+    write(b, t, 'REPORT.md', 'STATUS: done\n# 报告\n全文\n')
+    write(b, t, 'out/result.txt', 'hello\n')
+    code, data = b.read_task_file(ALICE, t, {})
+    assert code == 200 and data == {'path': 'REPORT.md', 'size': len('STATUS: done\n# 报告\n全文\n'.encode()),
+                                     'limit': 65536, 'truncated': False, 'binary': False,
+                                     'content': 'STATUS: done\n# 报告\n全文\n'}
+    assert b.read_task_file(ALICE, t, {'path': ''})[1]['path'] == 'REPORT.md'
+    assert b.read_task_file(ALICE, t, {'path': './out//result.txt'})[1]['content'] == 'hello\n'
+    code, data = b.list_files(ALICE, t)
+    assert code == 200 and data['truncated'] is False
+    paths = {f['path']: f for f in data['files']}
+    assert {'REPORT.md', 'TASK.md', 'answers/', 'out/', 'out/result.txt'} <= set(paths)
+    assert paths['out/result.txt'] == {'path': 'out/result.txt', 'type': 'file', 'size': 6}
+
+
+def test_reading_another_users_task_or_an_unknown_task_is_not_found(tmp_path):
+    b = make(tmp_path)
+    t = start(b, 1)
+    write(b, t, 'REPORT.md', 'STATUS: done\nsecret\n')
+    for owner, task_id in (('bob-sub', t), (ALICE, tid(99)), (ALICE, '../../etc')):
+        assert b.read_task_file(owner, task_id, {}) == (404, {'error': 'not_found'})
+        assert b.list_files(owner, task_id) == (404, {'error': 'not_found'})
+
+
+@pytest.mark.parametrize('path', ['../TASK.md', '..', 'out/../../x', '/etc/passwd', 'a\\..\\b', 'a\x00b', 'x' * 513, 7,
+                                  ['REPORT.md']])
+def test_traversal_and_malformed_paths_are_rejected(tmp_path, path):
+    b = make(tmp_path)
+    t = start(b, 1)
+    assert b.read_task_file(ALICE, t, {'path': path}) == (400, {'error': 'bad_path'})
+
+
+def test_symlinks_are_never_followed(tmp_path):
+    b = make(tmp_path)
+    t = start(b, 1)
+    secret = tmp_path / 'secret.txt'
+    secret.write_text('secret')
+    task_dir = Path(b.task(t)['task_dir'])
+    os.symlink(secret, task_dir / 'link.txt')
+    os.symlink(tmp_path, task_dir / 'linkdir')
+    assert b.read_task_file(ALICE, t, {'path': 'link.txt'}) == (400, {'error': 'symlink'})
+    assert b.read_task_file(ALICE, t, {'path': 'linkdir/secret.txt'}) == (400, {'error': 'symlink'})
+    files = {f['path']: f['type'] for f in b.list_files(ALICE, t)[1]['files']}
+    assert files['link.txt'] == 'symlink' and files['linkdir'] == 'symlink'
+    assert not any(p.startswith('linkdir/') for p in files)
+    # The task directory itself swapped for a link to another task's directory.
+    other = start(b, 2, task='另一个', topic='别的')
+    write(b, other, 'REPORT.md', 'STATUS: done\nother\n')
+    task_dir.rename(task_dir.with_name('moved'))
+    os.symlink(b.task(other)['task_dir'], task_dir)
+    assert b.read_task_file(ALICE, t, {}) == (400, {'error': 'symlink'})
+    assert b.list_files(ALICE, t) == (400, {'error': 'symlink'})
+
+
+def test_large_files_are_cut_at_64k_and_marked(tmp_path):
+    b = make(tmp_path)
+    t = start(b, 1)
+    write(b, t, 'big.md', 'a' + '汉' * 30000)   # 90001 bytes; the limit falls inside a 3-byte character
+    code, data = b.read_task_file(ALICE, t, {'path': 'big.md'})
+    assert code == 200 and data['truncated'] is True and data['size'] == 90001
+    assert data['content'] == 'a' + '汉' * 21845 and '�' not in data['content']
+    write(b, t, 'exact.md', 'x' * 65536)
+    assert b.read_task_file(ALICE, t, {'path': 'exact.md'})[1]['truncated'] is False
+
+
+def test_missing_directory_binary_and_special_files(tmp_path):
+    b = make(tmp_path)
+    t = start(b, 1)
+    assert b.read_task_file(ALICE, t, {}) == (404, {'error': 'not_found'})   # no REPORT.md yet
+    assert b.read_task_file(ALICE, t, {'path': 'nope/x.md'}) == (404, {'error': 'not_found'})
+    assert b.read_task_file(ALICE, t, {'path': 'answers'}) == (400, {'error': 'is_directory'})
+    assert b.read_task_file(ALICE, t, {'path': 'TASK.md/x'}) == (400, {'error': 'not_directory'})
+    write(b, t, 'img.png', b'\x89PNG\x00\x01')
+    assert b.read_task_file(ALICE, t, {'path': 'img.png'})[1] == {
+        'path': 'img.png', 'size': 6, 'limit': 65536, 'truncated': False, 'binary': True, 'content': None}
+    os.mkfifo(Path(b.task(t)['task_dir'], 'pipe'))
+    assert b.read_task_file(ALICE, t, {'path': 'pipe'}) == (400, {'error': 'not_regular_file'})
+    assert {'path': 'pipe', 'type': 'other'} in b.list_files(ALICE, t)[1]['files']
+
+
+def test_listing_is_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(hb, 'LIST_LIMIT', 5)
+    b = make(tmp_path)
+    t = start(b, 1)
+    for i in range(10):
+        write(b, t, 'f%02d' % i, 'x')
+    code, data = b.list_files(ALICE, t)
+    assert code == 200 and len(data['files']) == 5 and data['truncated'] is True
+
+
+def test_file_routes_over_http_need_the_owner(tmp_path):
+    b = make(tmp_path)
+    t = start(b, 1)
+    write(b, t, 'REPORT.md', 'STATUS: done\nhi\n')
+    server = hb.serve(b)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = 'http://127.0.0.1:%d' % server.server_address[1]
+
+    def call(method, path, sub, body=None):
+        req = urllib.request.Request(base + path, method=method, headers={hb.SUB_HEADER: sub},
+                                     data=json.dumps(body).encode() if body is not None else None)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+    try:
+        assert call('POST', '/tasks/%s/read' % t, ALICE, {})[1]['content'] == 'STATUS: done\nhi\n'
+        assert call('GET', '/tasks/%s/files' % t, ALICE)[0] == 200
+        assert call('POST', '/tasks/%s/read' % t, 'bob-sub', {})[0] == 404
+        assert call('GET', '/tasks/%s/files' % t, 'bob-sub')[0] == 404
+        assert call('POST', '/tasks/%s/read' % t, 'mallory', {})[0] == 403
+        assert call('POST', '/tasks/%s/read' % t, ALICE, {'path': '../../../etc/passwd'}) == (400, {'error': 'bad_path'})
+        assert call('GET', '/tasks/%s/read' % t, ALICE)[0] == 404
+    finally:
+        server.shutdown()
+
+
 # ---- herdr CLI wrapper and ledger storage ----
 
 def test_herdr_errors_on_stderr_are_understood(tmp_path):

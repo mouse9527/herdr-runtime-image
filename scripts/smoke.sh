@@ -117,6 +117,18 @@ wait_for 20 "answer file" ex test -f "$(tdir "${ids[2]}")/answers/q1.md"
 [ "$(state "${ids[2]}")" = running ] || fail "task 3 should be running after the answer"
 ok "tasks finish independently (completed / blocked -> answered -> running / running) while the lead stays the same"
 
+# Read-only file access on the real filesystem (home on NFS in CI).
+ex sh -c "d='$(tdir "${ids[1]}")'; mkdir -p \"\$d/out\" && echo artifact > \"\$d/out/a.txt\" && ln -s /etc/passwd \"\$d/out/link\""
+api -d '{}' "$B/tasks/${ids[1]}/read" | jq -e '.path == "REPORT.md" and .content == "STATUS: done\nsmoke result 2\n" and .truncated == false' >/dev/null \
+  || fail "read REPORT.md"
+api -d '{"path":"out/a.txt"}' "$B/tasks/${ids[1]}/read" | jq -e '.content == "artifact\n"' >/dev/null || fail "read artifact"
+api "$B/tasks/${ids[1]}/files" | jq -e '[.files[] | select(.path == "out/a.txt" or (.path == "out/link" and .type == "symlink"))] | length == 2' >/dev/null \
+  || fail "list task files"
+[ "$(code -H 'x-mcp-router-sub: smoke-user' -d '{"path":"out/link"}' "$B/tasks/${ids[1]}/read")" = 400 ] || fail "symlink read must be 400"
+[ "$(code -H 'x-mcp-router-sub: smoke-user' -d '{"path":"../../TOPIC.md"}' "$B/tasks/${ids[1]}/read")" = 400 ] || fail "traversal must be 400"
+[ "$(code -H 'x-mcp-router-sub: other-user' -d '{}' "$B/tasks/${ids[1]}/read")" = 403 ] || fail "other sub must be 403"
+ok "task files: REPORT.md by default, artifact, listing; symlink / traversal / other sub refused"
+
 # 5. sshd: key login lands in the same herdr session; passwords and forwarding are refused.
 SSH=(ssh -F /dev/null -o IdentitiesOnly=yes -i "$WORK/id" -p 12222 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
      -o LogLevel=ERROR agent@127.0.0.1)

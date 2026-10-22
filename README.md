@@ -126,6 +126,15 @@ REST API on `:8080` (the client is an Open WebUI event plugin; requests without 
 | `POST /tasks/{id}/reply` `{question_id, version, answer, request_key}` | receipt check first (a retried request returns `already_answered`), then 409 for a stale question |
 | `GET /tasks`, `GET /topics` | the caller's tasks / topics |
 | `POST /topics/{id}/close` | ask the topic's lead to write NOTES.md, then close it (409 while tasks are in flight) |
+| `GET /tasks/{id}/files` | `{files: [{path, type: file \| dir \| symlink \| other, size?}], truncated}`: the task directory, at most 500 entries / 6 levels |
+| `POST /tasks/{id}/read` `{path?}` | `{path, size, truncated, binary, content}`: the first 64 KB of one file in the task directory, `REPORT.md` when `path` is empty |
+
+**Reading task files** is read-only and limited to the caller's own task directory (another user's task is 404).
+`path` is relative; an absolute path, `..` or a backslash is 400 `bad_path`, and every component is opened without
+following symlinks (400 `symlink`), so a link planted by an agent cannot point outside. A larger file comes back cut
+at 64 KB with `truncated: true` and the real `size`; a file with NUL bytes comes back as `binary: true` without content.
+The path is in a POST body because the router only admits `[A-Za-z0-9_:/-]` in REST paths. The completion event
+carries the first 2500 characters of the report after its status line.
 
 **Identity.** The only identity is the `x-mcp-router-sub` header, which must be in `ALLOWED_SUBS`. It is trustworthy
 only because the router in front verified a signed token and overwrote the header, and NetworkPolicy lets nothing else
