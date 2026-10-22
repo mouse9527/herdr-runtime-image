@@ -10,12 +10,14 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 NAME=herdr-smoke-$$
 KEYS=herdr-smoke-keys-$$
 HOMEVOL=herdr-smoke-home-$$
+NET=herdr-smoke-net-$$
 WORK=$(mktemp -d)
 cleanup() {
   status=$?
   if [ $status -ne 0 ]; then echo "--- container log"; docker logs "$NAME" 2>&1 | tail -60 || true; fi
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   docker volume rm "$KEYS" "$HOMEVOL" >/dev/null 2>&1 || true
+  docker network rm "$NET" >/dev/null 2>&1 || true
   rm -rf "$WORK"
   exit $status
 }
@@ -41,7 +43,8 @@ docker volume create "$KEYS" >/dev/null
 docker run --rm -i --user 0 --entrypoint sh -v "$KEYS:/k" "$IMG" \
   -c 'cat > /k/authorized_keys && chmod 0644 /k/authorized_keys && chmod 0755 /k' < "$WORK/id.pub"
 
-docker run -d --name "$NAME" --read-only --tmpfs /tmp:mode=1777 -v "$HOME_MOUNT:/home/agent" \
+docker network create "$NET" >/dev/null
+docker run -d --name "$NAME" --network "$NET" --network-alias runtime --read-only --tmpfs /tmp:mode=1777 -v "$HOME_MOUNT:/home/agent" \
   --cap-drop ALL --security-opt no-new-privileges \
   -e ALLOWED_SUBS=smoke-user -e LEAD_DEFAULT_PROFILE=pi -e LEAD_MODEL_PI=smoke/smoke -e POLL_SECONDS=1 \
   -v "$KEYS:/etc/herdr-runtime/ssh:ro" -p 127.0.0.1:18080:8080 -p 127.0.0.1:12222:2222 "$IMG" >/dev/null
@@ -63,6 +66,10 @@ ex herdr session list --json | jq -e '.sessions[] | select(.name == "assistant" 
 ex test -S /tmp/herdr-runtime/herdr/sessions/assistant/herdr.sock || fail "herdr socket not on local /tmp"
 [ -z "$(ex find /home/agent -xdev -type s)" ] || fail "unix socket on the home volume: $(ex find /home/agent -xdev -type s)"
 ok "herdr server answers api snapshot; its sockets live in /tmp, none on the home volume"
+# `herdr machine add` refuses a server without detached_server_daemon, which herdr derives from getsid(0) == getpid().
+ex herdr --session assistant status server --json | jq -e '.capabilities.detached_server_daemon == true and .compatible' >/dev/null \
+  || fail "herdr server is not a detached daemon (session leader): $(ex herdr --session assistant status server --json)"
+ok "herdr server is a session leader (detached_server_daemon: true)"
 
 # 3. Bridge health and identity.
 [ "$(code $B/healthz)" = 200 ] && [ "$(code $B/readyz)" = 200 ] || fail "/healthz or /readyz"
@@ -111,12 +118,12 @@ wait_for 20 "answer file" ex test -f "$(tdir "${ids[2]}")/answers/q1.md"
 ok "tasks finish independently (completed / blocked -> answered -> running / running) while the lead stays the same"
 
 # 5. sshd: key login lands in the same herdr session; passwords and forwarding are refused.
-SSH=(ssh -i "$WORK/id" -p 12222 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+SSH=(ssh -F /dev/null -o IdentitiesOnly=yes -i "$WORK/id" -p 12222 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
      -o LogLevel=ERROR agent@127.0.0.1)
 out=$("${SSH[@]}" 'id -u; herdr --session assistant agent list') || fail "ssh key login"
 echo "$out" | head -1 | grep -qx 10001 || fail "ssh user is not uid 10001"
 echo "$out" | tail -1 | jq -e ".result.agents[] | select(.name == \"$lead\")" >/dev/null || fail "ssh does not see the lead"
-if ssh -p 12222 -o BatchMode=yes -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive \
+if ssh -F /dev/null -p 12222 -o BatchMode=yes -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive \
      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null agent@127.0.0.1 true 2>/dev/null; then
   fail "login without a key succeeded"
 fi
@@ -124,6 +131,19 @@ if "${SSH[@]}" -o ExitOnForwardFailure=yes -R 127.0.0.1:19999:127.0.0.1:8080 tru
   fail "remote port forwarding was allowed"
 fi
 ok "sshd: key login (uid 10001, sees the lead); password login and forwarding refused"
+
+# 5b. `herdr machine add` from a separate client container (same image, its own empty home), through an ssh-config alias.
+docker run --rm -i --network "$NET" --read-only --tmpfs /tmp:mode=1777 --tmpfs /home/agent:uid=10001,gid=10001,mode=0700 \
+  -e KEY="$(base64 < "$WORK/id")" -e HERDR_CONFIG_PATH=/home/agent/.config/herdr/config.toml --entrypoint bash "$IMG" -s \
+  > "$WORK/machine.log" 2>&1 <<'EOS' || { cat "$WORK/machine.log"; fail "herdr machine add"; }
+set -euo pipefail
+mkdir -p ~/.ssh ~/.config/herdr && chmod 700 ~/.ssh
+echo "$KEY" | base64 -d > ~/.ssh/id && chmod 600 ~/.ssh/id
+printf 'Host smoke-runtime\n  HostName runtime\n  Port 2222\n  User agent\n  IdentityFile ~/.ssh/id\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n' > ~/.ssh/config
+herdr machine add ssh://smoke-runtime --label smoke-runtime --remote-session assistant
+herdr --machine smoke-runtime agent list | jq -e '.result.agents | length >= 1'
+EOS
+ok "herdr machine add from another container saves the machine; --machine agent list sees the lead"
 
 # 6. Installed versions match the image labels and run.
 for c in herdr claude codex pi; do
@@ -146,8 +166,10 @@ ok "workspace, skills, host key on the volume; ledger uses a rollback journal"
 
 # 8. Restart (local /tmp is wiped, the volume stays): state survives, the lost execution is interrupted.
 docker stop -t 30 "$NAME" >/dev/null
-docker logs "$NAME" 2>&1 | grep -q 'supervisor: saved herdr state' || fail "herdr state not saved on stop"
-docker logs "$NAME" 2>&1 | grep -q 'supervisor: stopped' || fail "supervisor did not stop cleanly"
+# docker logs can lag right after stop; wait for the lines instead of reading once
+wait_for 10 "herdr state saved on stop" sh -c "docker logs '$NAME' 2>&1 | grep -q 'supervisor: saved herdr state'"
+wait_for 10 "supervisor stopped cleanly" sh -c "docker logs '$NAME' 2>&1 | grep -q 'supervisor: stopped'"
+docker logs "$NAME" 2>&1 | grep -E 'supervisor: (herdr server stop|saved herdr state|stopped)' | sed 's/^/  /'
 docker start "$NAME" >/dev/null
 wait_for 60 "bridge back" curl -fsS "$B/readyz"
 [ "$(ex ssh-keygen -lf /home/agent/.local/state/herdr-runtime/ssh/ssh_host_ed25519_key.pub)" = "$hostkey" ] || fail "host key changed"
