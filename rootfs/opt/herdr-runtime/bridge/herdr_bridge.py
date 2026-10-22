@@ -7,6 +7,9 @@ REST API on :8080 (client: the Open WebUI event plugin herdr_event; 1.1.4 reques
   GET  /tasks                  the caller's tasks
   GET  /topics                 the caller's topics
   POST /topics/{id}/close      ask the topic's lead to write NOTES.md, then close it
+  GET  /tasks/{id}/files       {files[<=500]: {path, type, size?}, truncated}  the task directory, symlinks not followed
+  POST /tasks/{id}/read        {path?='REPORT.md'} -> {path, size, truncated, binary, content}  first 64 KB of one file
+                               (read-only; the path is in the body because the router admits only [A-Za-z0-9_:/-] paths)
   GET  /healthz /readyz
 Identity: the only trusted identity is the `x-mcp-router-sub` header set by the router after it verified the user's
 signed token; it must be in ALLOWED_SUBS. Safe only while NetworkPolicy lets nothing but that router reach the port.
@@ -29,7 +32,7 @@ interrupted and never re-run automatically.
 Trust boundary: the bridge runs as the same UID as the agents it starts. It is a convenience layer for one user, not
 an authorization gate: an agent can read or modify this ledger.
 """
-import hashlib, json, os, re, sqlite3, subprocess, sys, threading, time, uuid
+import codecs, hashlib, json, os, re, sqlite3, stat, subprocess, sys, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -51,6 +54,13 @@ MISSING_POLLS = 3            # consecutive polls without the lead before its in-
 TUI_POLLS = 3                # consecutive polls of herdr 'blocked' before asking for a takeover
 PROMPT_CONFIRM_SECONDS = 30  # a new lead must visibly start working this long after its first prompt
 CLOSE_WAIT_SECONDS = 1800    # how long a closing lead gets to write NOTES.md
+FILE_LIMIT = 65536           # bytes POST /tasks/{id}/read returns; a larger file is cut and marked truncated
+LIST_LIMIT = 500             # entries GET /tasks/{id}/files returns
+LIST_DEPTH = 6               # directory levels GET /tasks/{id}/files descends
+# Completion event: REPORT.md after its first line, up to this many characters (was 1500). The event plugin rejects an
+# event whose json.dumps (ASCII-escaped: 6 bytes per CJK character) exceeds 20000; 2500 CJK characters plus the path
+# and topic name stay under it. The full report is one herdr_read (POST /tasks/{id}/read) away.
+SUMMARY_CHARS = 2500
 
 
 def log(*a):
@@ -168,6 +178,96 @@ def read_file(path, limit=65536):
         return None
     with os.fdopen(fd, 'rb') as f:
         return f.read(limit).decode('utf-8', 'replace')
+
+
+def clean_rel_path(path):
+    """'a/./b.md' -> ['a', 'b.md']; None for an absolute path, any '..', NUL / backslash, or an over-long path."""
+    if not isinstance(path, str) or len(path) > 512 or '\x00' in path or '\\' in path or path.startswith('/'):
+        return None
+    parts = [p for p in path.split('/') if p not in ('', '.')]
+    return parts if parts and '..' not in parts else None
+
+
+def entry_error(dfd, name):
+    """Why `name` in directory `dfd` could not be opened: missing | symlink | not_directory | unreadable."""
+    try:
+        st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return 'missing'
+    except OSError:
+        return 'unreadable'
+    if stat.S_ISLNK(st.st_mode):
+        return 'symlink'
+    return 'unreadable' if stat.S_ISDIR(st.st_mode) else 'not_directory'
+
+
+def walk_dir(start, parts):
+    """Open start/parts[0]/parts[1]/... as directories without following any symlink in `parts`. `start` is a
+    trusted path or an fd (not closed). Returns (fd, None) or (None, entry_error(...))."""
+    try:
+        fd = os.open(start, os.O_RDONLY | os.O_DIRECTORY) if isinstance(start, str) else os.dup(start)
+    except OSError:
+        return None, 'missing'
+    for p in parts:
+        try:
+            nfd = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        except OSError:
+            err = entry_error(fd, p)
+            os.close(fd)
+            return None, err
+        os.close(fd)
+        fd = nfd
+    return fd, None
+
+
+def read_entry(dfd, name, rel):
+    """(status, body) for regular file `name` in directory `dfd`: at most FILE_LIMIT bytes, never via a symlink."""
+    try:
+        # O_NONBLOCK: a FIFO planted in the task directory must not hang the request.
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    except OSError:
+        err = entry_error(dfd, name)
+        return (404, {'error': 'not_found'}) if err == 'missing' else (400, {'error': err})
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        return 400, {'error': 'is_directory' if stat.S_ISDIR(st.st_mode) else 'not_regular_file'}
+    with os.fdopen(fd, 'rb') as f:
+        data = f.read(FILE_LIMIT + 1)
+    truncated = len(data) > FILE_LIMIT
+    data = data[:FILE_LIMIT]
+    binary = b'\x00' in data
+    # final=False drops a multi-byte character cut in half by the limit instead of turning it into U+FFFD.
+    text = None if binary else codecs.getincrementaldecoder('utf-8')('replace').decode(data, final=not truncated)
+    return 200, {'path': rel, 'size': st.st_size, 'limit': FILE_LIMIT, 'truncated': truncated, 'binary': binary,
+                 'content': text}
+
+
+def list_tree(dfd, prefix, depth, out):
+    """Append the entries under directory `dfd` to `out` (symlinks listed, never followed). True if cut short."""
+    with os.scandir(dfd) as it:
+        entries = sorted(it, key=lambda e: e.name)
+    for e in entries:
+        if len(out) >= LIST_LIMIT:
+            return True
+        rel = prefix + e.name
+        if e.is_symlink():
+            out.append({'path': rel, 'type': 'symlink'})
+        elif e.is_dir(follow_symlinks=False):
+            out.append({'path': rel + '/', 'type': 'dir'})
+            if depth + 1 < LIST_DEPTH:
+                sub, err = walk_dir(dfd, [e.name])
+                if sub is not None:
+                    try:
+                        if list_tree(sub, rel + '/', depth + 1, out):
+                            return True
+                    finally:
+                        os.close(sub)
+        else:
+            st = e.stat(follow_symlinks=False)
+            regular = stat.S_ISREG(st.st_mode)
+            out.append({'path': rel, 'type': 'file' if regular else 'other', **({'size': st.st_size} if regular else {})})
+    return False
 
 
 def clean_name(text, limit=40):
@@ -393,6 +493,53 @@ class Bridge:
         self.spawn(self.deliver, tid, qid, version, qtext, answer, source)
         return 200, {'status': 'answered', 'question_id': qid, 'version': version}
 
+    # ---- read-only access to a task's own directory ----
+    def open_task_dir(self, owner, tid):
+        """(fd of the caller's task directory, None) or (None, (status, body)). Every component below WS_ROOT is
+        opened without following symlinks, so a swapped-in link anywhere on the way cannot point elsewhere."""
+        with self.lock:
+            t = self.task(tid) if isinstance(tid, str) and TASK_ID.fullmatch(tid) else None
+        if not t or t['owner'] != owner:
+            return None, (404, {'error': 'not_found'})
+        try:
+            rel = Path(t['task_dir']).relative_to(self.cfg.ws_root).parts
+        except ValueError:
+            return None, (404, {'error': 'not_found'})
+        fd, err = walk_dir(str(self.cfg.ws_root), rel)
+        if err:
+            return None, ((404, {'error': 'no_task_dir'}) if err == 'missing' else (400, {'error': err}))
+        return fd, None
+
+    def list_files(self, owner, tid):
+        fd, err = self.open_task_dir(owner, tid)
+        if err:
+            return err
+        try:
+            files = []
+            truncated = list_tree(fd, '', 0, files)
+        finally:
+            os.close(fd)
+        return 200, {'task_id': tid, 'files': files, 'truncated': truncated}
+
+    def read_task_file(self, owner, tid, body):
+        path = body.get('path') or 'REPORT.md'
+        parts = clean_rel_path(path)
+        if parts is None:
+            return 400, {'error': 'bad_path'}
+        fd, err = self.open_task_dir(owner, tid)
+        if err:
+            return err
+        try:
+            dfd, err = walk_dir(fd, parts[:-1])
+            if err:
+                return (404 if err == 'missing' else 400), {'error': 'not_found' if err == 'missing' else err}
+            try:
+                return read_entry(dfd, parts[-1], '/'.join(parts))
+            finally:
+                os.close(dfd)
+        finally:
+            os.close(fd)
+
     def close_topic(self, owner, topic_id):
         with self.lock, self.tx():
             tp = self.topic(topic_id)
@@ -575,7 +722,7 @@ class Bridge:
                 return
             if status == 'done':
                 self.finish(tid, 'completed', '报告写了 STATUS: done（待验收，不等于已批准）。报告：%s/REPORT.md\n%s'
-                            % (t['task_dir'], '\n'.join(lines[1:]).strip()[:1500]))
+                            % (t['task_dir'], '\n'.join(lines[1:]).strip()[:SUMMARY_CHARS]))
                 self.set_topic(t['topic_id'], last_active_at=self.clock())
                 return
             if status == 'blocked' and not self.open_question(tid):
@@ -819,6 +966,10 @@ class Api(Handler):
                 return b.events(sub, parts[1])
             if parts[2] == 'reply' and method == 'POST':
                 return b.reply(sub, parts[1], body)
+            if parts[2] == 'files' and method == 'GET':
+                return b.list_files(sub, parts[1])
+            if parts[2] == 'read' and method == 'POST':
+                return b.read_task_file(sub, parts[1], body)
         if len(parts) == 3 and parts[0] == 'topics' and parts[2] == 'close' and method == 'POST':
             return b.close_topic(sub, parts[1])
         return 404, {'error': 'path'}
