@@ -1,0 +1,28 @@
+# Rendered by herdr-runtime-supervisor into $HERDR_RUNTIME_DIR. sshd runs as the agent user, so only that user can log in.
+Port {{PORT}}
+HostKey {{HOST_KEY}}
+PidFile {{RUN}}/sshd.pid
+AuthorizedKeysFile {{AUTHORIZED_KEYS}}
+AllowUsers {{USER}}
+
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+PermitRootLogin no
+PermitEmptyPasswords no
+PermitUserEnvironment no
+PermitUserRC no
+
+# herdr machines talk over the SSH session's stdio; no forwarding of any kind is needed.
+AllowAgentForwarding no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+GatewayPorts no
+X11Forwarding no
+PermitTunnel no
+
+PrintMotd no
+LogLevel INFO
+ClientAliveInterval 30
+SetEnv {{ENV}}

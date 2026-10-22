@@ -1,0 +1,19 @@
+# herdr config baked into the image (read-only; HERDR_CONFIG_PATH points here).
+# Upgrades happen by rebuilding the image, never in place.
+
+[update]
+version_check = false
+manifest_check = false
+
+[session]
+# The task bridge decides what happens to interrupted work; herdr must not restart agents on its own.
+resume_agents_on_restore = false
+
+[experimental]
+pane_history = false
+
+[ui.toast]
+delivery = "off"
+
+[ui.sound]
+enabled = false

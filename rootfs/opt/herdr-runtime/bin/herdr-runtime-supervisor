@@ -1,0 +1,196 @@
+#!/usr/bin/python3
+"""Process supervisor for the herdr runtime container (runs as tini's child).
+
+Start order: prepare $HOME (the PVC) -> `herdr --session assistant server` (wait for `api snapshot`) -> task bridge
+-> sshd (non-root, :2222, public key only). A child that exits is restarted with backoff; if herdr exits, the bridge
+is stopped and started again after herdr is back (its startup recovery reports lost executions as interrupted).
+SIGTERM: stop the bridge (no new tasks), `herdr server stop` (lets herdr save its layout), stop sshd, exit.
+
+Environment:
+  HERDR_SESSION (assistant)  BRIDGE_DISABLED=1  SSH_DISABLED=1  SSH_PORT (2222)
+  SSH_AUTHORIZED_KEYS (/etc/herdr-runtime/ssh/authorized_keys; mount it read-only, the agent must not edit it)
+"""
+import os, shutil, signal, subprocess, sys, time
+from pathlib import Path
+
+OPT = Path('/opt/herdr-runtime')
+HOME = Path(os.environ.get('HOME') or '/home/agent')
+SESSION = os.environ.get('HERDR_SESSION', 'assistant')
+RUN = Path(os.environ.get('HERDR_RUNTIME_DIR', '/tmp/herdr-runtime'))
+STATE = HOME / '.local/state/herdr-runtime'
+WS = Path(os.environ.get('WS_ROOT') or HOME / 'workspaces/assistant')
+# Variables an SSH session needs to see the same herdr/CLI setup as the server. Never add secrets here.
+SSH_ENV = ('PATH', 'HERDR_CONFIG_PATH', 'HERDR_SESSION', 'WS_ROOT', 'DISABLE_AUTOUPDATER', 'PI_SKIP_VERSION_CHECK',
+           'GH_NO_UPDATE_NOTIFIER', 'LANG', 'BRIDGE_INTERNAL_PORT')
+stopping = False
+
+
+def log(*a):
+    print(time.strftime('%Y-%m-%dT%H:%M:%S'), 'supervisor:', *a, flush=True)
+
+
+def link(target, path):
+    """Point path at target unless the user put a real file or directory there (never overwrite user content)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        if os.readlink(path) == str(target):
+            return
+        path.unlink()
+    elif path.exists():
+        log('keeping user file', path)
+        return
+    path.symlink_to(target)
+
+
+def copy_missing(src, dst):
+    """Copy a template tree without touching anything that already exists."""
+    for s in sorted(src.rglob('*')):
+        d = dst / s.relative_to(src)
+        if s.is_symlink():
+            if not d.exists() and not d.is_symlink():
+                d.parent.mkdir(parents=True, exist_ok=True)
+                d.symlink_to(os.readlink(s))
+        elif s.is_dir():
+            d.mkdir(parents=True, exist_ok=True)
+        elif not d.exists():
+            d.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(s, d)
+
+
+def prepare_home():
+    for d in (STATE / 'ssh', HOME / '.claude', HOME / '.codex', HOME / '.pi/agent', WS / 'repos', WS / 'tasks', RUN):
+        d.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE / 'ssh', 0o700)
+    copy_missing(OPT / 'templates/ws', WS)
+    for skill in sorted((OPT / 'skills').iterdir()):
+        for root in ('.claude/skills', '.codex/skills', '.pi/agent/skills'):
+            link(skill, HOME / root / skill.name)
+    guide = OPT / 'templates/agent-guide.md'
+    for path in (HOME / '.claude/CLAUDE.md', HOME / '.codex/AGENTS.md', HOME / '.pi/agent/AGENTS.md'):
+        link(guide, path)
+    codex_cfg = HOME / '.codex/config.toml'
+    if not codex_cfg.exists():
+        codex_cfg.write_text('# Written once by herdr-runtime; edit freely.\ncheck_for_update_on_startup = false\n')
+    key = STATE / 'ssh/ssh_host_ed25519_key'
+    if not key.exists():
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'herdr-runtime-host', '-f', str(key)],
+                       check=True)
+        log('generated ssh host key', key)
+    for kind in ('claude', 'codex', 'pi'):
+        r = subprocess.run(['herdr', 'integration', 'install', kind], capture_output=True, text=True)
+        log('herdr integration install', kind, 'rc=%d' % r.returncode, (r.stdout + r.stderr).strip()[:200])
+
+
+def sshd_config():
+    keys = os.environ.get('SSH_AUTHORIZED_KEYS', '/etc/herdr-runtime/ssh/authorized_keys')
+    env = ' '.join('%s="%s"' % (k, os.environ[k]) for k in SSH_ENV if os.environ.get(k))
+    text = (OPT / 'etc/sshd_config.in').read_text()
+    for k, v in {'PORT': os.environ.get('SSH_PORT', '2222'), 'HOST_KEY': str(STATE / 'ssh/ssh_host_ed25519_key'),
+                 'RUN': str(RUN), 'AUTHORIZED_KEYS': keys, 'USER': os.environ.get('USER', 'agent'),
+                 'ENV': env}.items():
+        text = text.replace('{{' + k + '}}', v)
+    path = RUN / 'sshd_config'
+    path.write_text(text)
+    return path
+
+
+def herdr_ready(timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline and not stopping:
+        r = subprocess.run(['herdr', '--session', SESSION, 'api', 'snapshot'], capture_output=True, text=True)
+        if r.returncode == 0 and '"session_snapshot"' in r.stdout:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+class Child:
+    def __init__(self, name, argv, ready=None):
+        self.name, self.argv, self.ready = name, argv, ready
+        self.proc, self.failures, self.next_start, self.started = None, 0, 0.0, 0.0
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self):
+        log('start', self.name)
+        self.started = time.time()
+        self.proc = subprocess.Popen(self.argv, stdin=subprocess.DEVNULL)
+        if self.ready and not self.ready(30):
+            log(self.name, 'not ready within 30s')
+            self.stop()
+            return False
+        return True
+
+    def stop(self, timeout=10):
+        if self.alive():
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+
+    def exited(self):
+        """Record an exit and schedule the restart: 1, 2, 4 … 30 s; reset after a minute of healthy running."""
+        self.failures = 0 if time.time() - self.started > 60 else self.failures + 1
+        delay = min(30, 2 ** self.failures)
+        log(self.name, 'exited rc=%s, restart in %ds' % (self.proc.returncode if self.proc else '-', delay))
+        self.proc, self.next_start = None, time.time() + delay
+
+
+def main():
+    global stopping
+    prepare_home()
+    herdr = Child('herdr', ['herdr', '--session', SESSION, 'server'], ready=herdr_ready)
+    others = []
+    if os.environ.get('BRIDGE_DISABLED') != '1':
+        others.append(Child('bridge', [sys.executable, str(OPT / 'bridge/herdr_bridge.py')]))
+    if os.environ.get('SSH_DISABLED') != '1':
+        others.append(Child('sshd', ['/usr/sbin/sshd', '-D', '-e', '-f', str(sshd_config())]))
+
+    def on_signal(signum, _):
+        global stopping
+        stopping = True
+        log('signal', signum)
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    while not stopping:
+        if not herdr.alive():
+            if herdr.proc is not None:
+                herdr.exited()
+                for c in others:
+                    if c.name == 'bridge' and c.alive():
+                        c.stop()
+            if time.time() >= herdr.next_start and not herdr.start():
+                herdr.exited()
+            time.sleep(0.5)
+            continue
+        for c in others:
+            if c.alive():
+                continue
+            if c.proc is not None:
+                c.exited()
+            elif time.time() >= c.next_start:
+                c.start()
+        time.sleep(1)
+
+    for c in others:
+        if c.name == 'bridge':
+            c.stop()
+    if herdr.alive():
+        r = subprocess.run(['herdr', '--session', SESSION, 'server', 'stop'], capture_output=True, text=True,
+                           timeout=30)
+        log('herdr server stop rc=%d' % r.returncode)
+        try:
+            herdr.proc.wait(20)
+        except subprocess.TimeoutExpired:
+            herdr.stop()
+    for c in others:
+        c.stop()
+    log('stopped')
+
+
+if __name__ == '__main__':
+    main()

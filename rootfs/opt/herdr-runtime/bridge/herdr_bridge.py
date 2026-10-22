@@ -1,0 +1,634 @@
+"""herdr task bridge: turns delegated tasks into herdr leads and reports their progress.
+
+REST contract (the Open WebUI event plugin herdr_event 1.1.4 is the client; unchanged from its dry-run bridge), on :8080:
+  POST /tasks                  {id, generation, request_key, task}   create, or return the same execution
+  GET  /tasks/{id}/events      {state, question, events[<=64]}
+  POST /tasks/{id}/reply       {question_id, version, answer, request_key}   receipt first, then 409 when stale
+  GET  /tasks                  the caller's own tasks (read-only; not used by the plugin)
+  GET  /healthz /readyz
+Identity: the only trusted identity is the `x-mcp-router-sub` header set by mcp-router after it verified the OWUI-signed
+JWT, and it must be in ALLOWED_SUBS. This is safe only while NetworkPolicy lets nothing but mcp-router reach the port.
+
+Internal endpoint for the `task-ask` helper, 127.0.0.1:9100 only (never in a Service):
+  POST /internal/ask                       {task_id, text}  register a question for the human
+  GET  /internal/questions/{task}/{qid}    {state, answer}
+
+Execution: each task gets ~/workspaces/assistant/tasks/<id>/ with TASK.md, a new herdr tab and a named lead agent
+(profile allow-list, yolo flags and a pinned --model). Progress comes from herdr agent state plus the first line of
+REPORT.md (`STATUS: in-progress | done | blocked（...）`). Events sent upstream: needs_input / completed / failed /
+interrupted. After a bridge or Pod restart an execution is adopted only if the same herdr terminal is still there;
+otherwise it is reported interrupted and never re-run automatically.
+
+Trust boundary: the bridge runs as the same UID as the agents it starts. It is a convenience layer for one user, not
+an authorization gate: an agent can read or modify this ledger.
+"""
+import hashlib, json, os, re, sqlite3, subprocess, sys, threading, time, uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+SUB_HEADER = 'x-mcp-router-sub'
+TASK_ID = re.compile(r'deleg_[0-9a-f]{32}')
+# Profile allow-list: herdr agent kind -> CLI flags that start it without approval prompts (Owner 2026-10-22).
+PROFILES = {
+    'claude': ['--dangerously-skip-permissions'],
+    'codex': ['--dangerously-bypass-approvals-and-sandbox'],
+    'pi': [],
+}
+ACTIVE = ('accepted', 'running', 'blocked')
+EVENT_LIMIT = 64
+MAX_QUESTIONS = 16
+STATUS_LINE = re.compile(r'^\s*STATUS:\s*(in-progress|done|blocked)\b\s*(.*)$')
+PROFILE_LINE = re.compile(r'^@profile\s+([a-z]+)\s*$')
+MISSING_POLLS = 3   # consecutive polls without the agent before the task is failed
+TUI_POLLS = 3       # consecutive polls of herdr 'blocked' with no registered question before asking for a takeover
+PROMPT_CONFIRM_SECONDS = 30  # the lead must visibly start working this long after the task prompt
+
+
+def log(*a):
+    print(time.strftime('%Y-%m-%dT%H:%M:%S'), *a, flush=True)
+
+
+class Config:
+    def __init__(self, env=None):
+        env = os.environ if env is None else env
+        home = Path(env.get('HOME') or '/home/agent')
+        self.allowed = {x.strip() for x in env.get('ALLOWED_SUBS', '').split(',') if x.strip()}
+        self.host = env.get('BRIDGE_HOST', '0.0.0.0')
+        self.port = int(env.get('BRIDGE_PORT', '8080'))
+        self.internal_port = int(env.get('BRIDGE_INTERNAL_PORT', '9100'))
+        self.state_dir = Path(env.get('BRIDGE_STATE_DIR') or home / '.local/state/herdr-bridge')
+        self.ws_root = Path(env.get('WS_ROOT') or home / 'workspaces/assistant')
+        self.session = env.get('HERDR_SESSION', 'assistant')
+        self.default_profile = env.get('LEAD_DEFAULT_PROFILE', 'claude')
+        self.models = {p: env.get('LEAD_MODEL_' + p.upper(), '').strip() for p in PROFILES}
+        self.max_active = int(env.get('MAX_ACTIVE_TASKS', '1'))
+        self.poll = float(env.get('POLL_SECONDS', '5'))
+        self.template = Path(env.get('TASK_TEMPLATE', '/opt/herdr-runtime/templates/lead-task.md'))
+
+
+class HerdrError(Exception):
+    pass
+
+
+class Herdr:
+    """Thin argv wrapper around the herdr CLI for one session. Every result is herdr's JSON `result` object."""
+
+    def __init__(self, session, binary='herdr', timeout=60):
+        self.session, self.binary, self.timeout = session, binary, timeout
+
+    def call(self, *args, timeout=None):
+        try:
+            p = subprocess.run([self.binary, '--session', self.session, *args], capture_output=True, text=True,
+                               timeout=timeout or self.timeout, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            raise HerdrError('timeout') from None
+        except OSError as e:
+            raise HerdrError('exec_' + type(e).__name__) from None
+        try:
+            data = json.loads(p.stdout)
+        except ValueError:
+            raise HerdrError('bad_output_rc_%d' % p.returncode) from None
+        if data.get('error'):
+            raise HerdrError(str(data['error'].get('code') or 'error'))
+        return data.get('result') or {}
+
+    def snapshot(self):
+        return self.call('api', 'snapshot')
+
+    def workspace(self, label, cwd):
+        for w in self.call('workspace', 'list').get('workspaces', []):
+            if w.get('label') == label:
+                return w['workspace_id']
+        return self.call('workspace', 'create', '--label', label, '--cwd', str(cwd), '--no-focus')['workspace']['workspace_id']
+
+    def create_tab(self, workspace, label, cwd):
+        r = self.call('tab', 'create', '--workspace', workspace, '--label', label, '--cwd', str(cwd), '--no-focus')
+        return r['tab']['tab_id'], r['root_pane']['pane_id']
+
+    def start_agent(self, name, kind, pane, args):
+        return self.call('agent', 'start', name, '--kind', kind, '--pane', pane, '--timeout', '120000', '--', *args,
+                         timeout=150)
+
+    def agent(self, name):
+        try:
+            return self.call('agent', 'get', name).get('agent')
+        except HerdrError as e:
+            if str(e) == 'agent_not_found':
+                return None
+            raise
+
+    def prompt(self, name, text):
+        return self.call('agent', 'prompt', name, text)
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks(
+  id TEXT PRIMARY KEY, owner TEXT NOT NULL, request_key TEXT NOT NULL, generation INTEGER NOT NULL,
+  text TEXT NOT NULL, profile TEXT NOT NULL, state TEXT NOT NULL, boot_id TEXT NOT NULL, task_dir TEXT NOT NULL,
+  agent_name TEXT, tab_id TEXT, pane_id TEXT, terminal_id TEXT, detail TEXT, block_hash TEXT,
+  missing INTEGER NOT NULL DEFAULT 0, tui_polls INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS events(
+  task_id TEXT NOT NULL, seq INTEGER NOT NULL, event_id TEXT NOT NULL, kind TEXT NOT NULL, summary TEXT NOT NULL,
+  question TEXT, occurred_at REAL NOT NULL, PRIMARY KEY(task_id, seq));
+CREATE TABLE IF NOT EXISTS questions(
+  task_id TEXT NOT NULL, qid TEXT NOT NULL, version INTEGER NOT NULL, text TEXT NOT NULL, source TEXT NOT NULL,
+  state TEXT NOT NULL, answer TEXT, created_at REAL NOT NULL, answered_at REAL, PRIMARY KEY(task_id, qid));
+CREATE TABLE IF NOT EXISTS receipts(
+  request_key TEXT PRIMARY KEY, task_id TEXT NOT NULL, qid TEXT NOT NULL, version INTEGER NOT NULL, at REAL NOT NULL);
+"""
+
+
+def read_report(path, limit=65536):
+    """Read REPORT.md without following a symlink (the agent controls the task directory)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    with os.fdopen(fd, 'rb') as f:
+        return f.read(limit).decode('utf-8', 'replace')
+
+
+class Bridge:
+    def __init__(self, cfg, herdr, clock=time.time, sleep=time.sleep, spawn=None):
+        self.cfg, self.herdr, self.clock, self.sleep = cfg, herdr, clock, sleep
+        self.spawn = spawn or (lambda fn, *args: threading.Thread(target=fn, args=args, daemon=True).start())
+        self.boot_id = uuid.uuid4().hex
+        self.lock = threading.RLock()
+        cfg.state_dir.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(cfg.state_dir / 'ledger.sqlite3'), check_same_thread=False, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.executescript(SCHEMA)
+        self.ready_at = 0.0
+
+    # ---- ledger helpers (call with self.lock held) ----
+    def tx(self):
+        return _Tx(self)
+
+    def task(self, tid):
+        return self.db.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
+
+    def set(self, tid, **values):
+        values['updated_at'] = self.clock()
+        cols = ', '.join(k + '=?' for k in values)
+        self.db.execute('UPDATE tasks SET ' + cols + ' WHERE id=?', (*values.values(), tid))
+
+    def open_question(self, tid):
+        return self.db.execute("SELECT * FROM questions WHERE task_id=? AND state='open' ORDER BY version DESC LIMIT 1",
+                               (tid,)).fetchone()
+
+    def emit(self, tid, kind, summary, question=None):
+        t = self.task(tid)
+        seq = self.db.execute('SELECT COUNT(*) FROM events WHERE task_id=?', (tid,)).fetchone()[0] + 1
+        if seq > EVENT_LIMIT:
+            self.set(tid, detail='event_limit')
+            log('event_limit', tid)
+            return
+        self.db.execute('INSERT INTO events VALUES (?,?,?,?,?,?,?)',
+                        (tid, seq, tid + ':' + str(seq), kind, summary[:8000],
+                         json.dumps(question, ensure_ascii=False) if question else None, self.clock()))
+        log('event', tid, seq, kind, 'generation', t['generation'])
+
+    def finish(self, tid, kind, summary):
+        """Terminal transition: revoke open questions, set the state and emit the matching event."""
+        self.db.execute("UPDATE questions SET state='revoked' WHERE task_id=? AND state='open'", (tid,))
+        self.set(tid, state=kind)
+        self.emit(tid, kind, summary)
+
+    def ask(self, tid, text, source):
+        """Register a question for the human. Returns (qid, version) or None when the task cannot take one."""
+        t = self.task(tid)
+        if not t or t['state'] not in ACTIVE:
+            return None
+        n = self.db.execute('SELECT COUNT(*) FROM questions WHERE task_id=?', (tid,)).fetchone()[0] + 1
+        if n > MAX_QUESTIONS:
+            self.set(tid, detail='question_limit')
+            return None
+        self.db.execute("UPDATE questions SET state='revoked' WHERE task_id=? AND state='open'", (tid,))
+        qid, text = 'q' + str(n), text.strip()[:2000] or '(empty question)'
+        self.db.execute("INSERT INTO questions VALUES (?,?,?,?,?,'open',NULL,?,NULL)",
+                        (tid, qid, n, text, source, self.clock()))
+        self.set(tid, state='blocked')
+        self.emit(tid, 'needs_input', '等待回答：' + text[:200], {'id': qid, 'version': n, 'text': text})
+        return qid, n
+
+    # ---- REST operations: return (http_status, body) ----
+    def list_tasks(self, owner):
+        with self.lock:
+            rows = self.db.execute('SELECT id, state, created_at, updated_at FROM tasks WHERE owner=? '
+                                   'ORDER BY created_at DESC LIMIT 50', (owner,)).fetchall()
+        return 200, {'tasks': [{'id': r['id'], 'state': self.public_state(r['state']),
+                                'created_at': r['created_at'], 'updated_at': r['updated_at']} for r in rows]}
+
+    def create(self, owner, body):
+        tid, text = body.get('id'), body.get('task')
+        if not isinstance(tid, str) or not TASK_ID.fullmatch(tid):
+            return 400, {'error': 'task_id'}
+        if not isinstance(text, str) or not text.strip() or len(text) > 8000:
+            return 400, {'error': 'task_length'}
+        generation = body.get('generation', 1)
+        key = body.get('request_key') or ''
+        if type(generation) is not int or generation < 1 or not isinstance(key, str) or len(key) > 128:
+            return 400, {'error': 'bad_body'}
+        lines = text.strip().splitlines()
+        m = PROFILE_LINE.fullmatch(lines[0].strip())
+        profile = m[1] if m else self.cfg.default_profile
+        if m:
+            text = '\n'.join(lines[1:]).strip() or text
+        with self.lock, self.tx():
+            t = self.task(tid)
+            if t:
+                if t['owner'] != owner:
+                    return 404, {'error': 'not_found'}
+                if t['request_key'] != key or t['generation'] != generation:
+                    return 409, {'error': 'conflict'}
+                return 200, {'id': tid, 'status': 'existing'}
+            active = self.db.execute('SELECT COUNT(*) FROM tasks WHERE owner=? AND state IN (?,?,?)',
+                                     (owner, *ACTIVE)).fetchone()[0]
+            if active >= self.cfg.max_active:
+                return 429, {'error': 'capacity'}
+            now = self.clock()
+            self.db.execute('INSERT INTO tasks (id, owner, request_key, generation, text, profile, state, boot_id, '
+                            'task_dir, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                            (tid, owner, key, generation, text, profile, 'accepted', self.boot_id,
+                             str(self.cfg.ws_root / 'tasks' / tid), now, now))
+        log('task', tid, 'profile', profile)
+        self.spawn(self.launch, tid)
+        return 200, {'id': tid, 'status': 'started'}
+
+    @staticmethod
+    def public_state(state):
+        return 'running' if state == 'accepted' else state
+
+    def events(self, owner, tid):
+        with self.lock:
+            t = self.task(tid)
+            if not t or t['owner'] != owner:
+                return 404, {'error': 'not_found'}
+            rows = self.db.execute('SELECT * FROM events WHERE task_id=? ORDER BY seq', (tid,)).fetchall()
+            q = self.open_question(tid)
+        return 200, {
+            'state': self.public_state(t['state']),
+            'question': {'id': q['qid'], 'version': q['version'], 'text': q['text']} if q else None,
+            'events': [{'event_id': r['event_id'], 'seq': r['seq'], 'task_id': tid, 'generation': t['generation'],
+                        'kind': r['kind'], 'summary': r['summary'],
+                        'question': json.loads(r['question']) if r['question'] else None,
+                        'occurred_at': r['occurred_at']} for r in rows]}
+
+    def reply(self, owner, tid, body):
+        qid, version, answer, key = (body.get('question_id'), body.get('version'), body.get('answer'),
+                                     body.get('request_key'))
+        if (not isinstance(qid, str) or type(version) is not int or not isinstance(answer, str)
+                or not answer.strip() or len(answer) > 4000 or not isinstance(key, str) or not key or len(key) > 256):
+            return 400, {'error': 'bad_body'}
+        with self.lock, self.tx():
+            t = self.task(tid)
+            if not t or t['owner'] != owner:
+                return 404, {'error': 'not_found'}
+            # Receipt before the current-question check: a retry after a lost response is safe.
+            r = self.db.execute('SELECT * FROM receipts WHERE request_key=?', (key,)).fetchone()
+            if r:
+                if r['task_id'] != tid:
+                    return 409, {'error': 'conflict'}
+                return 200, {'status': 'already_answered', 'question_id': r['qid'], 'version': r['version']}
+            q = self.open_question(tid)
+            if not q or q['qid'] != qid or q['version'] != version or t['state'] != 'blocked':
+                return 409, {'error': 'stale_question'}
+            now = self.clock()
+            self.db.execute("UPDATE questions SET state='answered', answer=?, answered_at=? WHERE task_id=? AND qid=?",
+                            (answer, now, tid, qid))
+            self.db.execute('INSERT INTO receipts VALUES (?,?,?,?,?)', (key, tid, qid, version, now))
+            self.set(tid, state='running', tui_polls=0)
+            source, qtext = q['source'], q['text']
+        log('reply', tid, qid, version)
+        self.spawn(self.deliver, tid, qid, version, qtext, answer, source)
+        return 200, {'status': 'answered', 'question_id': qid, 'version': version}
+
+    # ---- internal endpoint for task-ask ----
+    def internal_ask(self, body):
+        tid, text = body.get('task_id'), body.get('text')
+        if not isinstance(tid, str) or not TASK_ID.fullmatch(tid) or not isinstance(text, str) or not text.strip():
+            return 400, {'error': 'bad_body'}
+        with self.lock, self.tx():
+            r = self.ask(tid, text, 'ask')
+        if not r:
+            return 409, {'error': 'task_not_active'}
+        return 200, {'question_id': r[0], 'version': r[1]}
+
+    def internal_question(self, tid, qid):
+        with self.lock:
+            q = self.db.execute('SELECT * FROM questions WHERE task_id=? AND qid=?', (tid, qid)).fetchone()
+        if not q:
+            return 404, {'error': 'not_found'}
+        return 200, {'question_id': qid, 'version': q['version'], 'state': q['state'], 'answer': q['answer']}
+
+    # ---- execution ----
+    def render_task(self, t):
+        task_dir = Path(t['task_dir'])
+        template = self.cfg.template.read_text() if self.cfg.template.is_file() else DEFAULT_TEMPLATE
+        values = {'TASK_ID': t['id'], 'TASK_DIR': str(task_dir), 'REPORT': str(task_dir / 'REPORT.md'),
+                  'ANSWERS': str(task_dir / 'answers'), 'WS_ROOT': str(self.cfg.ws_root), 'PROFILE': t['profile']}
+        for k, v in values.items():
+            template = template.replace('{{' + k + '}}', v)
+        return template.replace('{{TASK_TEXT}}', t['text'])  # last, so the task text is never expanded
+
+    def launch(self, tid):
+        with self.lock:
+            t = self.task(tid)
+        profile, model = t['profile'], self.cfg.models.get(t['profile'], '')
+        if profile not in PROFILES or not model:
+            with self.lock, self.tx():
+                self.finish(tid, 'failed', '无法启动：profile %r 不在白名单或部署未配置 LEAD_MODEL_%s（不使用 CLI 默认模型）'
+                            % (profile, profile.upper()))
+            return
+        # The agent name must be unique for the life of the herdr session (finished leads stay for review).
+        name, short = 'lead-' + tid[6:], tid[6:14]
+        task_dir = Path(t['task_dir'])
+        step = 'task_dir'
+        try:
+            (task_dir / 'answers').mkdir(parents=True, exist_ok=True)
+            brief = task_dir / 'TASK.md'
+            if not brief.exists():
+                brief.write_text(self.render_task(t))
+            step = 'workspace'
+            ws = self.herdr.workspace('assistant', self.cfg.ws_root)
+            step = 'tab'
+            tab, pane = self.herdr.create_tab(ws, 'T·' + short, task_dir)
+            with self.lock, self.tx():
+                self.set(tid, tab_id=tab, pane_id=pane, agent_name=name)
+            step = 'agent_start'
+            self.herdr.start_agent(name, profile, pane, [*PROFILES[profile], '--model', model])
+            a = self.herdr.agent(name)
+            if not a:
+                raise HerdrError('agent_missing_after_start')
+            with self.lock, self.tx():
+                self.set(tid, terminal_id=a.get('terminal_id'), state='running')
+            step = 'prompt'
+            self.herdr.prompt(name, '读 %s 并照做。' % brief)
+            step = 'confirm'
+            started = self.confirm_working(name, a, task_dir)
+        except (HerdrError, OSError, KeyError) as e:
+            log('launch_failed', tid, step, type(e).__name__, e)
+            with self.lock, self.tx():
+                self.finish(tid, 'failed', '启动 lead 失败（步骤 %s：%s）。未自动重试；pane 如已创建会保留供人工核对。'
+                            % (step, str(e)[:200]))
+            return
+        log('launched', tid, name, pane, 'working' if started else 'not_started')
+        if not started:
+            # herdr reports a CLI as ready while it still shows first-run screens (theme, login, trust), and the
+            # prompt is swallowed there. Never type into it again blindly: ask for a takeover.
+            with self.lock, self.tx():
+                self.ask(tid, 'lead %s 启动后 %d 秒内没有开始工作，可能停在 CLI 的首次引导 / 登录 / 信任界面，任务 prompt 可能被吞。'
+                              '请 Owner 用 herdr machine 接管 tab T·%s：处理完界面后对 lead 重发「读 %s/TASK.md 并照做。」，'
+                              '然后回答任意内容，bridge 继续跟踪。' % (name, PROMPT_CONFIRM_SECONDS, short, task_dir), 'tui')
+
+    def confirm_working(self, name, before, task_dir):
+        """True once the lead is working/blocked, has changed state since the prompt, or has started its report."""
+        deadline = self.clock() + PROMPT_CONFIRM_SECONDS
+        while True:
+            a = self.herdr.agent(name)
+            if a and (a.get('agent_status') in ('working', 'blocked')
+                      or a.get('state_change_seq') != before.get('state_change_seq')):
+                return True
+            if read_report(os.path.join(str(task_dir), 'REPORT.md')) is not None:
+                return True
+            if self.clock() >= deadline:
+                return False
+            self.sleep(2)
+
+    def deliver(self, tid, qid, version, question, answer, source):
+        """Hand an answer to the lead: a file in answers/ plus a prompt naming it."""
+        with self.lock:
+            t = self.task(tid)
+        path = Path(t['task_dir']) / 'answers' / ('%s.md' % qid)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('# %s（version %d）\n\n## 问题\n\n%s\n\n## 用户回答\n\n%s\n' % (qid, version, question, answer))
+            if source != 'tui' and t['agent_name']:
+                self.herdr.prompt(t['agent_name'], '用户回答了问题 %s：见 %s。读完按回答继续；任务书仍是 %s/TASK.md。'
+                                  % (qid, path, t['task_dir']))
+        except (HerdrError, OSError) as e:
+            log('deliver_failed', tid, qid, type(e).__name__, e)
+            with self.lock, self.tx():
+                self.set(tid, detail='deliver_failed:%s:%s' % (qid, str(e)[:80]))
+
+    def observe(self, t):
+        """One poll of a launched task: herdr agent state + REPORT.md first line -> events."""
+        tid = t['id']
+        try:
+            agent = self.herdr.agent(t['agent_name'])
+        except HerdrError as e:
+            with self.lock, self.tx():
+                self.set(tid, detail='observe:' + str(e)[:80])
+            return
+        report = read_report(os.path.join(t['task_dir'], 'REPORT.md'))
+        lines = (report or '').splitlines()
+        m = STATUS_LINE.match(lines[0]) if lines else None
+        status, rest = (m[1], m[2].strip()) if m else (None, '')
+        with self.lock, self.tx():
+            t = self.task(tid)
+            if t['state'] not in ('running', 'blocked'):
+                return
+            if status == 'done':
+                body = '\n'.join(lines[1:]).strip()
+                self.finish(tid, 'completed', '报告写了 STATUS: done（待验收，不等于已批准）。报告：%s/REPORT.md\n%s'
+                            % (t['task_dir'], body[:1500]))
+                return
+            if agent is None:
+                missing = t['missing'] + 1
+                self.set(tid, missing=missing)
+                if missing >= MISSING_POLLS:
+                    self.finish(tid, 'failed', 'lead %s 已不在 herdr 中，报告未写 STATUS: done。任务目录：%s'
+                                % (t['agent_name'], t['task_dir']))
+                return
+            self.set(tid, missing=0)
+            if self.open_question(tid):
+                return
+            if status == 'blocked':
+                h = hashlib.sha256('\n'.join(lines[:40]).encode()).hexdigest()
+                if h != t['block_hash']:
+                    self.set(tid, block_hash=h)
+                    self.ask(tid, '%s\n\n（来自 %s/REPORT.md）\n%s' % (rest, t['task_dir'], '\n'.join(lines[1:30])),
+                             'report')
+                return
+            if agent.get('agent_status') == 'blocked':
+                polls = t['tui_polls'] + 1
+                self.set(tid, tui_polls=polls)
+                if polls == TUI_POLLS:
+                    self.ask(tid, 'lead %s 停在 CLI 自己的交互界面（权限 / 登录 / 确认框），bridge 不会代按按键。'
+                                  '请 Owner 用 herdr machine 接管处理；处理完回答任意内容，bridge 继续跟踪。' % t['agent_name'],
+                             'tui')
+            else:
+                self.set(tid, tui_polls=0)
+
+    def observe_all(self):
+        with self.lock:
+            rows = self.db.execute("SELECT * FROM tasks WHERE state IN ('running','blocked') AND agent_name IS NOT NULL "
+                                   "AND terminal_id IS NOT NULL").fetchall()
+        for t in rows:
+            try:
+                self.observe(t)
+            except Exception as e:  # one bad task must not stop the loop
+                log('observe_error', t['id'], type(e).__name__, e)
+
+    def recover(self):
+        """At startup: adopt executions whose herdr terminal is still alive; everything else is interrupted."""
+        with self.lock:
+            rows = self.db.execute('SELECT * FROM tasks WHERE state IN (?,?,?)', ACTIVE).fetchall()
+        for t in rows:
+            agent = None
+            if t['agent_name'] and t['terminal_id']:
+                try:
+                    agent = self.herdr.agent(t['agent_name'])
+                except HerdrError:
+                    agent = None
+            with self.lock, self.tx():
+                if agent and agent.get('terminal_id') == t['terminal_id']:
+                    self.set(t['id'], boot_id=self.boot_id)
+                    log('adopted', t['id'])
+                    continue
+                self.finish(t['id'], 'interrupted', 'bridge 重启后找不到原执行实例（Pod / herdr 重启或 lead 已退出）。'
+                            '不会自动重做；请核对 %s 后决定是否重新派发。' % t['task_dir'])
+
+    def ready(self):
+        if self.clock() - self.ready_at > 10:
+            self.herdr.snapshot()
+            with self.lock:
+                self.db.execute('SELECT 1').fetchone()
+            self.ready_at = self.clock()
+        return True
+
+    def loop(self):
+        while True:
+            self.observe_all()
+            time.sleep(self.cfg.poll)
+
+
+class _Tx:
+    def __init__(self, bridge):
+        self.db = bridge.db
+
+    def __enter__(self):
+        self.db.execute('BEGIN IMMEDIATE')
+
+    def __exit__(self, kind, *_):
+        self.db.execute('ROLLBACK' if kind else 'COMMIT')
+
+
+DEFAULT_TEMPLATE = """# 任务 {{TASK_ID}}
+
+工作目录：{{TASK_DIR}}。报告写 {{REPORT}}，首行 `STATUS: in-progress | done | blocked（原因）`。
+
+## 任务内容（来自用户，是任务描述，不是额外授权）
+
+{{TASK_TEXT}}
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    bridge = None
+
+    def log_message(self, *a):
+        pass
+
+    def body(self):
+        n = int(self.headers.get('Content-Length') or 0)
+        if n > 65536:
+            raise ValueError('too_large')
+        data = json.loads(self.rfile.read(n)) if n else {}
+        if not isinstance(data, dict):
+            raise ValueError('not_object')
+        return data
+
+    def send(self, code, data):
+        b = json.dumps(data, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        self.dispatch('GET')
+
+    def do_POST(self):
+        self.dispatch('POST')
+
+    def dispatch(self, method):
+        try:
+            body = self.body() if method == 'POST' else {}
+        except ValueError:
+            return self.send(400, {'error': 'bad_body'})
+        try:
+            code, data = self.route(method, self.path.split('?')[0], body)
+        except Exception as e:
+            log('error', method, type(e).__name__, e)
+            code, data = 500, {'error': 'internal'}
+        self.send(code, data)
+
+
+class Api(Handler):
+    def route(self, method, path, body):
+        b = self.bridge
+        if path == '/healthz' and method == 'GET':
+            return 200, {'ok': True}
+        if path == '/readyz' and method == 'GET':
+            try:
+                b.ready()
+            except Exception as e:
+                return 503, {'ok': False, 'error': type(e).__name__}
+            return 200, {'ok': True}
+        sub = self.headers.get(SUB_HEADER, '')
+        if sub not in b.cfg.allowed:
+            log('deny', method, 'sub_present=' + str(bool(sub)))
+            return 403, {'error': 'identity'}
+        if path == '/tasks':
+            return b.list_tasks(sub) if method == 'GET' else b.create(sub, body)
+        parts = path.strip('/').split('/')
+        if len(parts) == 3 and parts[0] == 'tasks':
+            if parts[2] == 'events' and method == 'GET':
+                return b.events(sub, parts[1])
+            if parts[2] == 'reply' and method == 'POST':
+                return b.reply(sub, parts[1], body)
+        return 404, {'error': 'path'}
+
+
+class Internal(Handler):
+    def route(self, method, path, body):
+        b = self.bridge
+        if path == '/healthz':
+            return 200, {'ok': True}
+        if path == '/internal/ask' and method == 'POST':
+            return b.internal_ask(body)
+        parts = path.strip('/').split('/')
+        if len(parts) == 4 and parts[:2] == ['internal', 'questions'] and method == 'GET':
+            return b.internal_question(parts[2], parts[3])
+        return 404, {'error': 'path'}
+
+
+def serve(bridge):
+    api = type('BoundApi', (Api,), {'bridge': bridge})
+    internal = type('BoundInternal', (Internal,), {'bridge': bridge})
+    threading.Thread(target=ThreadingHTTPServer(('127.0.0.1', bridge.cfg.internal_port), internal).serve_forever,
+                     daemon=True).start()
+    return ThreadingHTTPServer((bridge.cfg.host, bridge.cfg.port), api)
+
+
+def main():
+    cfg = Config()
+    if not cfg.allowed:
+        sys.exit('ALLOWED_SUBS is empty')
+    bridge = Bridge(cfg, Herdr(cfg.session))
+    bridge.recover()
+    threading.Thread(target=bridge.loop, daemon=True).start()
+    server = serve(bridge)
+    usable = [p for p, m in cfg.models.items() if m]
+    log('herdr bridge on :%d (internal 127.0.0.1:%d), allowed subs: %d, profiles with a model: %s'
+        % (cfg.port, cfg.internal_port, len(cfg.allowed), ','.join(usable) or 'none'))
+    server.serve_forever()
+
+
+if __name__ == '__main__':
+    main()
