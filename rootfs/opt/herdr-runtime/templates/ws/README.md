@@ -11,7 +11,9 @@ lead 按 skill 纪律工作：任务书写文件、派 worker 用 herdr、合并
 
 ## 2. 锚点
 
-**锚点是 bridge 派来的任务号**（`deleg_<32 位十六进制>`），目录 `tasks/<任务号>/`；bridge 建好目录和 `TASK.md`。
+**锚点是 bridge 派来的任务号**（`deleg_<32 位十六进制>`）。任务按 topic 归组：一个 topic 一个常驻 lead、一个 herdr tab，
+目录 `topics/<topic_id>/`（`TOPIC.md` 说明、`NOTES.md` 结论），每个任务在 `topics/<topic_id>/tasks/<任务号>/`
+（`TASK.md`、`REPORT.md`、`answers/`），这些都由 bridge 建。同一 topic 可同时有多个任务，lead 自己调度。
 任务涉及某个 GitHub Issue 时，PR body 写 `Part of <owner>/<repo>#<n>`，并在报告里写出 Issue 链接。
 没有任务号的工作不开工。
 
@@ -19,12 +21,13 @@ lead 按 skill 纪律工作：任务书写文件、派 worker 用 herdr、合并
 
 | 信息 | 权威来源 | 本地做什么 |
 |---|---|---|
-| 这次要做什么 / 不做什么 / 止损 | `tasks/<任务号>/TASK.md`（bridge 写入，来自用户） | 只读 |
+| 这次要做什么 / 不做什么 / 止损 | `topics/<topic>/tasks/<任务号>/TASK.md`（bridge 写入，来自用户） | 只读 |
 | 任务涉及的 Issue | GitHub Issue | 只读，`gh issue view` |
 | 候选版本 | PR + commit SHA | 只读 |
 | 验证结果 | PR checks（GitHub Actions） | 只读，`gh pr checks` |
-| 任务进度 / 交回 | `tasks/<任务号>/REPORT.md` 首行 `STATUS:` | lead 写，bridge 读 |
-| 用户的回答 | `tasks/<任务号>/answers/<问题号>.md` | 只读 |
+| 任务进度 / 交回 | `topics/<topic>/tasks/<任务号>/REPORT.md` 首行 `STATUS:` | lead 写，bridge 读 |
+| topic 的结论 / 交接 | `topics/<topic>/NOTES.md` | lead 收尾时写，新 lead 先读 |
+| 用户的回答 | `topics/<topic>/tasks/<任务号>/answers/<问题号>.md` | 只读 |
 | 当前在做什么 | `NOW.md` | 随手改，丢了无所谓 |
 
 ## 4. 仓库表
@@ -33,7 +36,8 @@ lead 按 skill 纪律工作：任务书写文件、派 worker 用 herdr、合并
 |---|---|---|---|---|---|
 | 待定 | `https://github.com/<owner>/<repo>.git` | main | main | GitHub Actions | 用到时 `gh repo clone` 到 `repos/` |
 
-- GitHub 身份来自环境变量 `GH_TOKEN`（部署时注入）。用 `gh` 和 HTTPS remote；`gh auth setup-git` 让 git 走同一身份。
+- GitHub 身份是 Owner 在 Pod 里 `gh auth login --with-token` 存下的登录态（`~/.config/gh/hosts.yml`，在持久卷上）；
+  部署也可以改用环境变量 `GH_TOKEN`。用 `gh` 和 HTTPS remote；`gh auth setup-git` 让 git 走同一身份。
 - 本 Pod 没有 docker、kubectl、编译工具链；需要构建 / 测试的交给 PR 的 CI。
 
 ## 5. 权限边界
@@ -53,7 +57,7 @@ lead 按 skill 纪律工作：任务书写文件、派 worker 用 herdr、合并
 
 ## 7. 本 ws 追加的规则
 
-- **不能直接问用户**。需要用户决定时：在任务目录里运行 `task-ask "问题"`（立即返回问题号），
+- **不能直接问用户**。需要用户决定时：运行 `task-ask --task <任务号> "问题"`（立即返回问题号），
   或把报告首行写成 `STATUS: blocked（需要用户决定：…）`；然后结束本轮等待。回答会写到
   `answers/<问题号>.md`，并有一条 prompt 通知你。不要自己替用户定。
 - herdr session 名是 `assistant`。pane 里的 herdr 命令自动指向它；在 SSH 里用 `herdr --session assistant …`。

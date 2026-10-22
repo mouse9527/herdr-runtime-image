@@ -4,7 +4,8 @@
 
 - 工作区：`~/workspaces/assistant/`。开工前读它的 `README.md`（本 Pod 的规则），以及 skill
   `workspace`、`herdr-workers`（`/opt/herdr-runtime/skills/<名>/SKILL.md`）。
-- 任务从 `~/workspaces/assistant/tasks/<任务号>/TASK.md` 来；进度写同目录 `REPORT.md`，首行 `STATUS:`。
-- 不能直接问用户：用 `task-ask "问题"` 或报告首行 `STATUS: blocked（需要用户决定：…）`。
+- 你如果是某个 topic 的 lead：先读 `~/workspaces/assistant/topics/<topic>/TOPIC.md` 和 `NOTES.md`；任务从
+  `topics/<topic>/tasks/<任务号>/TASK.md` 来，进度写同目录 `REPORT.md`，首行 `STATUS:`。可能有多个任务同时在飞。
+- 不能直接问用户：用 `task-ask --task <任务号> "问题"` 或报告首行 `STATUS: blocked（需要用户决定：…）`。
 - 派 worker 用 herdr（session `assistant`），yolo 启动、显式 `--model`、只信产物。
 - 不把任何凭据写进文件、日志、提交、PR。

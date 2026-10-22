@@ -4,7 +4,8 @@
   task-ask "要用 A 方案还是 B 方案？"          register, print the question id, return immediately
   task-ask --wait [--timeout S] "…"          register, then block until answered (for scripts, not agent tool calls)
 
-The task is found from --task, $HERDR_TASK_ID, or the current directory (…/tasks/deleg_<32 hex>/…).
+The task is found from --task, $HERDR_TASK_ID, or the current directory (…/tasks/deleg_<32 hex>/…); a lead
+working for several tasks of a topic should always pass --task.
 The answer arrives as answers/<question_id>.md in the task directory, and the lead is prompted to read it.
 Exit codes: 0 registered/answered, 2 usage, 3 revoked or timed out, 4 bridge refused/unreachable.
 """

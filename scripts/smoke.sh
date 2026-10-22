@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # Smoke test for a built image: scripts/smoke.sh <image>
-# Runs it the way the cluster will (read-only root, home on a separate volume, no capabilities, non-root) and checks
-# every process, the herdr server, bridge identity rules, sshd, the pinned tool versions and the image filesystem.
+# Runs it the way the cluster will: read-only root, /tmp as a fresh local dir, home on a persistent volume (set
+# SMOKE_HOME_DIR to an NFS mount to test the real storage; otherwise a docker volume), no capabilities, non-root.
+# Exercises every herdr subcommand the bridge depends on with a real lead (pi with an offline dummy model), three
+# concurrent tasks in one topic, and a restart.
 set -euo pipefail
 IMG=${1:?usage: smoke.sh <image>}
 HERE=$(cd "$(dirname "$0")" && pwd)
 NAME=herdr-smoke-$$
 KEYS=herdr-smoke-keys-$$
+HOMEVOL=herdr-smoke-home-$$
 WORK=$(mktemp -d)
 cleanup() {
   status=$?
-  if [ $status -ne 0 ]; then echo "--- container log"; docker logs "$NAME" 2>&1 | tail -50 || true; fi
+  if [ $status -ne 0 ]; then echo "--- container log"; docker logs "$NAME" 2>&1 | tail -60 || true; fi
   docker rm -f "$NAME" >/dev/null 2>&1 || true
-  docker volume rm "$KEYS" >/dev/null 2>&1 || true
+  docker volume rm "$KEYS" "$HOMEVOL" >/dev/null 2>&1 || true
   rm -rf "$WORK"
   exit $status
 }
@@ -20,6 +23,17 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "ok - $*"; }
 ex() { docker exec "$NAME" "$@"; }
+B=http://127.0.0.1:18080
+code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+api() { curl -fsS -H 'x-mcp-router-sub: smoke-user' -H 'content-type: application/json' "$@"; }
+wait_for() {  # wait_for <seconds> <description> <command...>
+  local n=$1 what=$2; shift 2
+  for _ in $(seq 1 "$n"); do "$@" >/dev/null 2>&1 && return 0; sleep 1; done
+  fail "timed out: $what"
+}
+
+if [ -n "${SMOKE_HOME_DIR:-}" ]; then HOME_MOUNT="$SMOKE_HOME_DIR"; else HOME_MOUNT=$HOMEVOL; docker volume create "$HOMEVOL" >/dev/null
+  docker run --rm --user 0 --entrypoint chown -v "$HOMEVOL:/h" "$IMG" 10001:10001 /h; fi
 
 # authorized_keys arrives root-owned and read-only, like a Kubernetes Secret volume.
 ssh-keygen -q -t ed25519 -N '' -C smoke -f "$WORK/id"
@@ -27,15 +41,14 @@ docker volume create "$KEYS" >/dev/null
 docker run --rm -i --user 0 --entrypoint sh -v "$KEYS:/k" "$IMG" \
   -c 'cat > /k/authorized_keys && chmod 0644 /k/authorized_keys && chmod 0755 /k' < "$WORK/id.pub"
 
-docker run -d --name "$NAME" --read-only --tmpfs /tmp --tmpfs /home/agent:uid=10001,gid=10001,mode=0700 \
+docker run -d --name "$NAME" --read-only --tmpfs /tmp:mode=1777 -v "$HOME_MOUNT:/home/agent" \
   --cap-drop ALL --security-opt no-new-privileges \
-  -e ALLOWED_SUBS=smoke-user -v "$KEYS:/etc/herdr-runtime/ssh:ro" \
-  -p 127.0.0.1:18080:8080 -p 127.0.0.1:12222:2222 "$IMG" >/dev/null
+  -e ALLOWED_SUBS=smoke-user -e LEAD_DEFAULT_PROFILE=pi -e LEAD_MODEL_PI=smoke/smoke -e POLL_SECONDS=1 \
+  -v "$KEYS:/etc/herdr-runtime/ssh:ro" -p 127.0.0.1:18080:8080 -p 127.0.0.1:12222:2222 "$IMG" >/dev/null
+wait_for 60 "bridge /healthz" curl -fsS "$B/healthz"
+echo "--- $(ex cat /opt/herdr-runtime/VERSIONS | tr '\n' ';')"
 
-for _ in $(seq 1 60); do curl -fsS -o /dev/null http://127.0.0.1:18080/healthz 2>/dev/null && break; sleep 1; done
-code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
-
-# 1. Non-root everywhere.
+# 1. Non-root everywhere, read-only root.
 [ "$(ex id -u)" = 10001 ] || fail "id -u is not 10001"
 uids=$(ex ps -eo uid= | tr -d ' ' | sort -u | tr '\n' ' ')
 [ "$uids" = "10001 " ] || fail "processes not all uid 10001: $uids"
@@ -43,27 +56,66 @@ ok "all processes run as uid 10001"
 ex sh -c 'touch /opt/herdr-runtime/x 2>/dev/null || touch /usr/local/bin/x 2>/dev/null' && fail "root filesystem is writable"
 ok "root filesystem is read-only"
 
-# 2. herdr headless server and API snapshot.
+# 2. herdr headless server; sockets and locks off the (NFS) home volume.
 ex herdr --session assistant api snapshot | jq -e '.result.type == "session_snapshot"' >/dev/null || fail "api snapshot"
-ok "herdr --session assistant server answers api snapshot"
+ex herdr session list --json | jq -e '.sessions[] | select(.name == "assistant" and .running)' >/dev/null \
+  || fail "session list does not show assistant running"
+ex test -S /tmp/herdr-runtime/herdr/sessions/assistant/herdr.sock || fail "herdr socket not on local /tmp"
+[ -z "$(ex find /home/agent -xdev -type s)" ] || fail "unix socket on the home volume: $(ex find /home/agent -xdev -type s)"
+ok "herdr server answers api snapshot; its sockets live in /tmp, none on the home volume"
 
 # 3. Bridge health and identity.
-[ "$(code http://127.0.0.1:18080/healthz)" = 200 ] || fail "/healthz"
-[ "$(code http://127.0.0.1:18080/readyz)" = 200 ] || fail "/readyz"
-[ "$(code http://127.0.0.1:18080/tasks)" = 403 ] || fail "no sub must be 403"
-[ "$(code -H 'x-mcp-router-sub: someone-else' http://127.0.0.1:18080/tasks)" = 403 ] || fail "unknown sub must be 403"
-[ "$(code -H 'x-mcp-router-sub: smoke-user' http://127.0.0.1:18080/tasks)" = 200 ] || fail "allowed sub must be 200"
-[ "$(code -H 'x-mcp-router-sub: smoke-user' http://127.0.0.1:18080/tasks/deleg_00000000000000000000000000000000/events)" = 404 ] \
-  || fail "unknown task must be 404"
+[ "$(code $B/healthz)" = 200 ] && [ "$(code $B/readyz)" = 200 ] || fail "/healthz or /readyz"
+[ "$(code $B/tasks)" = 403 ] || fail "no sub must be 403"
+[ "$(code -H 'x-mcp-router-sub: someone-else' $B/tasks)" = 403 ] || fail "unknown sub must be 403"
+[ "$(code -H 'x-mcp-router-sub: smoke-user' $B/tasks)" = 200 ] || fail "allowed sub must be 200"
+[ "$(code -H 'x-mcp-router-sub: smoke-user' $B/topics)" = 200 ] || fail "allowed sub /topics must be 200"
 ok "bridge: healthz/readyz 200, no sub 403, other sub 403, allowed sub 200"
 
-# 4. sshd: key login as the agent user lands in the same herdr session; passwords and forwarding are refused.
+# 4. A real lead in herdr: three concurrent tasks in one topic (one chat), each finishing on its own report.
+docker exec -i "$NAME" sh -c 'mkdir -p ~/.pi/agent && cat > ~/.pi/agent/models.json' <<'JSON'
+{"providers": {"smoke": {"baseUrl": "http://127.0.0.1:9/v1", "api": "openai-completions", "apiKey": "offline",
+  "models": [{"id": "smoke"}]}}}
+JSON
+ids=()
+for n in 1 2 3; do
+  id=deleg_$(printf '%032x' "$n")
+  ids+=("$id")
+  api -d "{\"id\":\"$id\",\"generation\":1,\"request_key\":\"k$n\",\"task\":\"smoke task $n\",\"parent_chat_id\":\"chat-smoke\",\"topic\":\"smoke topic\"}" \
+    "$B/tasks" | jq -e '.status == "started" and .topic.name == "smoke topic"' >/dev/null || fail "POST /tasks $n"
+done
+state() { api "$B/tasks/$1/events" | jq -r .state; }
+prompted() { ex python3 -c "import sqlite3,sys; c=sqlite3.connect('/home/agent/.local/state/herdr-bridge/ledger.sqlite3'); sys.exit(0 if c.execute('select count(*) from tasks where prompted=1').fetchone()[0]==3 else 1)"; }
+wait_for 120 "all three tasks prompted to the lead" prompted
+for id in "${ids[@]}"; do [ "$(state "$id")" = running ] || fail "$id not running: $(api "$B/tasks/$id/events")"; done
+topics=$(api "$B/topics")
+echo "$topics" | jq -e '(.topics | length) == 1 and .topics[0].active_tasks == 3' >/dev/null || fail "one topic expected: $topics"
+lead=$(echo "$topics" | jq -r '.topics[0].lead')
+ex herdr --session assistant agent get "$lead" | jq -e '.result.agent | .agent == "pi" and (.terminal_id | length > 0) and (.state_change_seq | type == "number") and (.agent_status | type == "string")' >/dev/null \
+  || fail "agent get JSON fields"
+[ "$(ex herdr --session assistant agent list | jq "[.result.agents[] | select(.name == \"$lead\")] | length")" = 1 ] || fail "lead not in agent list"
+tdir() { ex find /home/agent/workspaces/assistant/topics -maxdepth 3 -type d -name "$1"; }
+for id in "${ids[@]}"; do ex test -f "$(tdir "$id")/TASK.md" || fail "TASK.md missing for $id"; done
+ok "one topic lead ($lead) started via herdr agent start, all three task briefs prompted; agent get/list fields present"
+
+ex sh -c "printf 'STATUS: done\nsmoke result 2\n' > '$(tdir "${ids[1]}")/REPORT.md'"
+ex sh -c "printf 'STATUS: blocked（需要用户决定：A 还是 B）\n' > '$(tdir "${ids[2]}")/REPORT.md'"
+wait_for 30 "task 2 completed" sh -c "[ \"\$(curl -s -H 'x-mcp-router-sub: smoke-user' $B/tasks/${ids[1]}/events | jq -r .state)\" = completed ]"
+wait_for 30 "task 3 blocked" sh -c "[ \"\$(curl -s -H 'x-mcp-router-sub: smoke-user' $B/tasks/${ids[2]}/events | jq -r .state)\" = blocked ]"
+[ "$(state "${ids[0]}")" = running ] || fail "task 1 must still be running"
+q=$(api "$B/tasks/${ids[2]}/events" | jq -c .question)
+api -d "{\"question_id\":$(echo "$q" | jq .id),\"version\":$(echo "$q" | jq .version),\"answer\":\"B\",\"request_key\":\"r1\"}" \
+  "$B/tasks/${ids[2]}/reply" | jq -e '.status == "answered"' >/dev/null || fail "reply"
+wait_for 20 "answer file" ex test -f "$(tdir "${ids[2]}")/answers/q1.md"
+[ "$(state "${ids[2]}")" = running ] || fail "task 3 should be running after the answer"
+ok "tasks finish independently (completed / blocked -> answered -> running / running) while the lead stays the same"
+
+# 5. sshd: key login lands in the same herdr session; passwords and forwarding are refused.
 SSH=(ssh -i "$WORK/id" -p 12222 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
      -o LogLevel=ERROR agent@127.0.0.1)
-out=$("${SSH[@]}" 'id -u; herdr --version; herdr session list --json') || fail "ssh key login"
+out=$("${SSH[@]}" 'id -u; herdr --session assistant agent list') || fail "ssh key login"
 echo "$out" | head -1 | grep -qx 10001 || fail "ssh user is not uid 10001"
-echo "$out" | tail -1 | jq -e '.sessions[] | select(.name == "assistant" and .running)' >/dev/null \
-  || fail "ssh session does not see the running assistant session"
+echo "$out" | tail -1 | jq -e ".result.agents[] | select(.name == \"$lead\")" >/dev/null || fail "ssh does not see the lead"
 if ssh -p 12222 -o BatchMode=yes -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive \
      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null agent@127.0.0.1 true 2>/dev/null; then
   fail "login without a key succeeded"
@@ -71,35 +123,45 @@ fi
 if "${SSH[@]}" -o ExitOnForwardFailure=yes -R 127.0.0.1:19999:127.0.0.1:8080 true 2>/dev/null; then
   fail "remote port forwarding was allowed"
 fi
-ok "sshd: key login (uid 10001, sees session assistant); password login and forwarding refused"
+ok "sshd: key login (uid 10001, sees the lead); password login and forwarding refused"
 
-# 5. Pinned tool versions.
-want_claude=$(jq -r '.dependencies["@anthropic-ai/claude-code"]' "$HERE/../cli/package.json")
-want_codex=$(jq -r '.dependencies["@openai/codex"]' "$HERE/../cli/package.json")
-want_pi=$(jq -r '.dependencies["@earendil-works/pi-coding-agent"]' "$HERE/../cli/package.json")
-ex claude --version | tee /dev/stderr | grep -qF "$want_claude" || fail "claude version"
-ex codex --version | tee /dev/stderr | grep -qF "$want_codex" || fail "codex version"
-ex pi --version 2>&1 | tee /dev/stderr | grep -qF "$want_pi" || fail "pi version"
-ex gh --version | head -1 | tee /dev/stderr | grep -q 'gh version' || fail "gh"
-ex herdr --version | tee /dev/stderr | grep -q '^herdr ' || fail "herdr"
-ok "claude $want_claude, codex $want_codex, pi $want_pi, gh, herdr report their versions"
+# 6. Installed versions match the image labels and run.
+for c in herdr claude codex pi; do
+  want=$(docker image inspect "$IMG" --format "{{index .Config.Labels \"io.github.mouse9527.herdr-runtime.$c\"}}")
+  [ -n "$want" ] || fail "label for $c missing"
+  ex "$c" --version 2>&1 | tee /dev/stderr | grep -qF "$want" || fail "$c --version does not report $want"
+done
+ex gh --version | head -1 | grep -q 'gh version' || fail "gh"
+ok "herdr, claude, codex, pi report the labelled versions; gh runs"
 
-# 6. Volume layout prepared on first start.
+# 7. Volume layout and ledger storage.
 ex test -f /home/agent/workspaces/assistant/README.md || fail "ws README missing"
 ex test -f /home/agent/.claude/skills/workspace/SKILL.md || fail "workspace skill link missing"
 ex test -f /home/agent/.claude/skills/herdr-workers/SKILL.md || fail "herdr-workers skill link missing"
-ex test -f /home/agent/.local/state/herdr-runtime/ssh/ssh_host_ed25519_key || fail "host key not on the volume"
-ok "workspace, skills and ssh host key are on the home volume"
+ex python3 -c "import sqlite3,sys; sys.exit(sqlite3.connect('/home/agent/.local/state/herdr-bridge/ledger.sqlite3').execute('pragma journal_mode').fetchone()[0] != 'delete')" \
+  || fail "ledger journal_mode is not delete"
+ex test ! -e /home/agent/.local/state/herdr-bridge/ledger.sqlite3-wal || fail "ledger has a WAL file"
+hostkey=$(ex ssh-keygen -lf /home/agent/.local/state/herdr-runtime/ssh/ssh_host_ed25519_key.pub)
+ok "workspace, skills, host key on the volume; ledger uses a rollback journal"
 
-# 7. No credentials in the image: positive control first, then the whole filesystem (excluding the live volume).
+# 8. Restart (local /tmp is wiped, the volume stays): state survives, the lost execution is interrupted.
+docker stop -t 30 "$NAME" >/dev/null
+docker logs "$NAME" 2>&1 | grep -q 'supervisor: saved herdr state' || fail "herdr state not saved on stop"
+docker logs "$NAME" 2>&1 | grep -q 'supervisor: stopped' || fail "supervisor did not stop cleanly"
+docker start "$NAME" >/dev/null
+wait_for 60 "bridge back" curl -fsS "$B/readyz"
+[ "$(ex ssh-keygen -lf /home/agent/.local/state/herdr-runtime/ssh/ssh_host_ed25519_key.pub)" = "$hostkey" ] || fail "host key changed"
+ex herdr --session assistant workspace list | jq -e '.result.workspaces[] | select(.label == "assistant")' >/dev/null \
+  || fail "herdr layout not restored"
+[ "$(state "${ids[1]}")" = completed ] || fail "completed task lost"
+[ "$(state "${ids[0]}")" = interrupted ] || fail "in-flight task should be interrupted after restart"
+[ -z "$(ex find /home/agent -xdev -type s)" ] || fail "socket on the home volume after restart"
+ok "after restart: same host key, herdr layout restored, ledger kept, in-flight task interrupted (not re-run)"
+
+# 9. No credentials in the image: positive control first, then the whole filesystem (no volume mounted).
 mkdir "$WORK/control"
 python3 -c "print('token=' + 'ghp_' + 'Q' * 36)" > "$WORK/control/planted"
 if python3 "$HERE/scan_secrets.py" "$WORK/control" >/dev/null; then fail "scanner missed a planted token"; fi
 docker run --rm -i --user 0 --entrypoint python3 "$IMG" - / < "$HERE/scan_secrets.py" || fail "credential-like data in image"
 ok "no token / private key shaped strings in the image (scanner caught the planted control)"
-
-# 8. Graceful stop.
-docker stop -t 30 "$NAME" >/dev/null
-docker logs "$NAME" 2>&1 | grep -q 'supervisor: stopped' || fail "supervisor did not stop cleanly"
-ok "SIGTERM stops bridge, herdr and sshd cleanly"
 echo "smoke: all checks passed"
