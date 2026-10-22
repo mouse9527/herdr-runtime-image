@@ -171,8 +171,8 @@ def herdr_ready(timeout):
 
 
 class Child:
-    def __init__(self, name, argv, ready=None):
-        self.name, self.argv, self.ready = name, argv, ready
+    def __init__(self, name, argv, ready=None, new_session=False):
+        self.name, self.argv, self.ready, self.new_session = name, argv, ready, new_session
         self.proc, self.failures, self.next_start, self.started = None, 0, 0.0, 0.0
 
     def alive(self):
@@ -181,7 +181,7 @@ class Child:
     def start(self):
         log('start', self.name)
         self.started = time.time()
-        self.proc = subprocess.Popen(self.argv, stdin=subprocess.DEVNULL)
+        self.proc = subprocess.Popen(self.argv, stdin=subprocess.DEVNULL, start_new_session=self.new_session)
         if self.ready and not self.ready(30):
             log(self.name, 'not ready within 30s')
             self.stop()
@@ -210,7 +210,10 @@ def main():
     prepare_home()
     session_dir = prepare_herdr_session()
     last_save = time.time()
-    herdr = Child('herdr', ['herdr', '--session', SESSION, 'server'], ready=herdr_ready)
+    # herdr only reports the detached_server_daemon capability (required by `herdr machine add`) when the server is
+    # a session leader (getsid(0) == getpid()), as when it daemonizes itself with setsid(). It is still our child:
+    # we watch it, signal it by pid and stop it with `herdr server stop`; tini only signals us, not this session.
+    herdr = Child('herdr', ['herdr', '--session', SESSION, 'server'], ready=herdr_ready, new_session=True)
     others = []
     if os.environ.get('BRIDGE_DISABLED') != '1':
         others.append(Child('bridge', [sys.executable, str(OPT / 'bridge/herdr_bridge.py')]))
@@ -250,25 +253,30 @@ def main():
             last_save = time.time()
         time.sleep(1)
 
+    # Fits a 30 s stop budget (docker default; the Pod gets 60 s): bridge ≤5 s, herdr ≤15 s, then the state save,
+    # which must happen even when herdr is slow to stop.
+    t0 = time.time()
     for c in others:
         if c.name == 'bridge':
-            c.stop()
-    if herdr.alive():
-        r = subprocess.run(['herdr', '--session', SESSION, 'server', 'stop'], capture_output=True, text=True,
-                           timeout=30)
-        log('herdr server stop rc=%d' % r.returncode)
-        try:
-            herdr.proc.wait(20)
-        except subprocess.TimeoutExpired:
-            herdr.stop()
+            c.stop(5)
     try:
-        save_herdr_state(session_dir)
-        log('saved herdr state')
-    except OSError as e:
-        log('saving herdr state failed:', e)
+        if herdr.alive():
+            r = subprocess.run(['herdr', '--session', SESSION, 'server', 'stop'], capture_output=True, text=True,
+                               timeout=10)
+            log('herdr server stop rc=%d after %.1fs' % (r.returncode, time.time() - t0))
+            herdr.proc.wait(5)
+    except subprocess.TimeoutExpired:
+        log('herdr did not stop in time after %.1fs; terminating it' % (time.time() - t0))
+    finally:
+        herdr.stop(3)
+        try:
+            save_herdr_state(session_dir)
+            log('saved herdr state after %.1fs' % (time.time() - t0))
+        except OSError as e:
+            log('saving herdr state failed:', e)
     for c in others:
-        c.stop()
-    log('stopped')
+        c.stop(3)
+    log('stopped after %.1fs' % (time.time() - t0))
 
 
 if __name__ == '__main__':
