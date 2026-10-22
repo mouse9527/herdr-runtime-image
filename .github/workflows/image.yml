@@ -19,6 +19,7 @@ jobs:
         with:
           python-version: '3.11' # the image's python3 (Debian bookworm)
           cache: pip
+          cache-dependency-path: requirements-dev.txt
       - run: pip install -r requirements-dev.txt
       - run: pytest -q
       - name: No credentials in the repository
