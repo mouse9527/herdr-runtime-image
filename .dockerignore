@@ -1,0 +1,9 @@
+.git
+.github
+**/__pycache__
+.pytest_cache
+tests
+scripts
+*.md
+!rootfs/**/*.md
+cli/node_modules

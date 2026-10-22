@@ -1,0 +1,81 @@
+#!/usr/bin/python3
+"""Register a question for the human who delegated the current task.
+
+  task-ask "要用 A 方案还是 B 方案？"          register, print the question id, return immediately
+  task-ask --wait [--timeout S] "…"          register, then block until answered (for scripts, not agent tool calls)
+
+The task is found from --task, $HERDR_TASK_ID, or the current directory (…/tasks/deleg_<32 hex>/…).
+The answer arrives as answers/<question_id>.md in the task directory, and the lead is prompted to read it.
+Exit codes: 0 registered/answered, 2 usage, 3 revoked or timed out, 4 bridge refused/unreachable.
+"""
+import argparse, json, os, re, sys, time, urllib.error, urllib.request
+
+BASE = 'http://127.0.0.1:%s' % os.environ.get('BRIDGE_INTERNAL_PORT', '9100')
+TASK = re.compile(r'deleg_[0-9a-f]{32}')
+
+
+def call(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(BASE + path, data=data, method=method, headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read() or b'{}')
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b'{}')
+
+
+def find_task(explicit):
+    if explicit:
+        return explicit
+    if os.environ.get('HERDR_TASK_ID'):
+        return os.environ['HERDR_TASK_ID']
+    parts = os.path.realpath(os.getcwd()).split(os.sep)
+    for prev, part in zip(parts, parts[1:]):
+        if prev == 'tasks' and TASK.fullmatch(part):
+            return part
+    return None
+
+
+def main():
+    p = argparse.ArgumentParser(description='Ask the human who delegated this task a question.')
+    p.add_argument('question')
+    p.add_argument('--task')
+    p.add_argument('--wait', action='store_true')
+    p.add_argument('--timeout', type=float, default=0, help='seconds; 0 = no limit (only with --wait)')
+    a = p.parse_args()
+    task = find_task(a.task)
+    if not task or not TASK.fullmatch(task):
+        print('task-ask: run inside a task directory (…/tasks/deleg_…/) or pass --task', file=sys.stderr)
+        return 2
+    try:
+        code, r = call('POST', '/internal/ask', {'task_id': task, 'text': a.question})
+    except OSError as e:
+        print('task-ask: bridge unreachable: %s' % e, file=sys.stderr)
+        return 4
+    if code != 200:
+        print('task-ask: bridge refused: %s' % r.get('error'), file=sys.stderr)
+        return 4
+    qid = r['question_id']
+    print('registered %s (version %d) for %s; the answer will be written to answers/%s.md and you will be prompted.'
+          % (qid, r['version'], task, qid), flush=True)
+    if not a.wait:
+        return 0
+    deadline = time.time() + a.timeout if a.timeout > 0 else None
+    while deadline is None or time.time() < deadline:
+        try:
+            code, r = call('GET', '/internal/questions/%s/%s' % (task, qid))
+        except OSError:
+            code, r = 0, {}
+        if code == 200 and r.get('state') == 'answered':
+            print(r.get('answer') or '')
+            return 0
+        if code == 200 and r.get('state') == 'revoked':
+            print('task-ask: question %s was revoked' % qid, file=sys.stderr)
+            return 3
+        time.sleep(3)
+    print('task-ask: timed out waiting for %s' % qid, file=sys.stderr)
+    return 3
+
+
+if __name__ == '__main__':
+    sys.exit(main())
