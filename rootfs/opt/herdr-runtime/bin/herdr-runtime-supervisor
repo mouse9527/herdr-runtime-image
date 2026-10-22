@@ -6,11 +6,17 @@ Start order: prepare $HOME (the PVC) -> `herdr --session assistant server` (wait
 is stopped and started again after herdr is back (its startup recovery reports lost executions as interrupted).
 SIGTERM: stop the bridge (no new tasks), `herdr server stop` (lets herdr save its layout), stop sshd, exit.
 
+$HOME is an NFS volume. Unix sockets and lock files must not live there, and herdr always creates its sockets inside
+~/.config/herdr/sessions/<session>/. So ~/.config/herdr/sessions is a symlink into $HERDR_RUNTIME_DIR (local emptyDir;
+`herdr session list` ignores a symlinked session dir but follows a symlinked parent), and only
+herdr's layout state (session.json, session-snapshots/) is kept on the volume: restored before the server starts,
+saved every minute and after a clean stop. A hard kill can lose up to a minute of layout changes.
+
 Environment:
   HERDR_SESSION (assistant)  BRIDGE_DISABLED=1  SSH_DISABLED=1  SSH_PORT (2222)
   SSH_AUTHORIZED_KEYS (/etc/herdr-runtime/ssh/authorized_keys; mount it read-only, the agent must not edit it)
 """
-import os, shutil, signal, subprocess, sys, time
+import json, os, shutil, signal, subprocess, sys, time
 from pathlib import Path
 
 OPT = Path('/opt/herdr-runtime')
@@ -22,6 +28,9 @@ WS = Path(os.environ.get('WS_ROOT') or HOME / 'workspaces/assistant')
 # Variables an SSH session needs to see the same herdr/CLI setup as the server. Never add secrets here.
 SSH_ENV = ('PATH', 'HERDR_CONFIG_PATH', 'HERDR_SESSION', 'WS_ROOT', 'DISABLE_AUTOUPDATER', 'PI_SKIP_VERSION_CHECK',
            'GH_NO_UPDATE_NOTIFIER', 'LANG', 'BRIDGE_INTERNAL_PORT')
+HERDR_LOCAL = RUN / 'herdr'                      # sockets, lock, live session dir (local disk)
+HERDR_SAVED = STATE / 'herdr-session'           # layout state copy (volume)
+SAVE_SECONDS = 60
 stopping = False
 
 
@@ -57,8 +66,65 @@ def copy_missing(src, dst):
             shutil.copyfile(s, d)
 
 
+def local_link(path, target):
+    """Make path a symlink to a local target. A real file or dir there (older layout) is removed after the caller
+    saved what it needs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        if os.readlink(path) == str(target):
+            return
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+    path.symlink_to(target)
+
+
+def save_herdr_state(src):
+    """Copy herdr's layout state from src to the volume; skip a session.json that is mid-write (invalid JSON)."""
+    HERDR_SAVED.mkdir(parents=True, exist_ok=True)
+    sj = src / 'session.json'
+    if sj.is_file():
+        data = sj.read_bytes()
+        try:
+            json.loads(data)
+        except ValueError:
+            log('session.json not valid JSON, not saved this time')
+        else:
+            tmp = HERDR_SAVED / 'session.json.tmp'
+            tmp.write_bytes(data)
+            os.replace(tmp, HERDR_SAVED / 'session.json')
+    snaps = src / 'session-snapshots'
+    if snaps.is_dir():
+        new, old = HERDR_SAVED / 'session-snapshots.new', HERDR_SAVED / 'session-snapshots'
+        shutil.rmtree(new, ignore_errors=True)
+        shutil.copytree(snaps, new)
+        shutil.rmtree(old, ignore_errors=True)
+        os.replace(new, old)
+
+
+def prepare_herdr_session():
+    local = HERDR_LOCAL / 'sessions' / SESSION
+    local.mkdir(parents=True, exist_ok=True)
+    link = HOME / '.config/herdr/sessions'
+    old = link / SESSION
+    if not link.is_symlink() and old.is_dir() and not old.is_symlink():
+        save_herdr_state(old)         # state written by an image that kept the session on the volume
+    local_link(link, HERDR_LOCAL / 'sessions')
+    local_link(HOME / '.config/herdr/.plugins.lock', HERDR_LOCAL / 'plugins.lock')
+    for name in ('session.json', 'session-snapshots'):
+        src, dst = HERDR_SAVED / name, local / name
+        if src.is_dir():
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(src, dst)
+        elif src.is_file():
+            shutil.copyfile(src, dst)
+    return local
+
+
 def prepare_home():
-    for d in (STATE / 'ssh', HOME / '.claude', HOME / '.codex', HOME / '.pi/agent', WS / 'repos', WS / 'tasks', RUN):
+    for d in (STATE / 'ssh', HOME / '.claude', HOME / '.codex', HOME / '.pi/agent', WS / 'repos', WS / 'topics', RUN):
         d.mkdir(parents=True, exist_ok=True)
     os.chmod(STATE / 'ssh', 0o700)
     copy_missing(OPT / 'templates/ws', WS)
@@ -142,6 +208,8 @@ class Child:
 def main():
     global stopping
     prepare_home()
+    session_dir = prepare_herdr_session()
+    last_save = time.time()
     herdr = Child('herdr', ['herdr', '--session', SESSION, 'server'], ready=herdr_ready)
     others = []
     if os.environ.get('BRIDGE_DISABLED') != '1':
@@ -174,6 +242,12 @@ def main():
                 c.exited()
             elif time.time() >= c.next_start:
                 c.start()
+        if time.time() - last_save >= SAVE_SECONDS:
+            try:
+                save_herdr_state(session_dir)
+            except OSError as e:
+                log('saving herdr state failed:', e)
+            last_save = time.time()
         time.sleep(1)
 
     for c in others:
@@ -187,6 +261,11 @@ def main():
             herdr.proc.wait(20)
         except subprocess.TimeoutExpired:
             herdr.stop()
+    try:
+        save_herdr_state(session_dir)
+        log('saved herdr state')
+    except OSError as e:
+        log('saving herdr state failed:', e)
     for c in others:
         c.stop()
     log('stopped')

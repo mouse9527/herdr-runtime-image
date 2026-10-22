@@ -6,4 +6,3 @@ tests
 scripts
 *.md
 !rootfs/**/*.md
-cli/node_modules

@@ -1,4 +1,4 @@
-import importlib.machinery, importlib.util
+import importlib.machinery, importlib.util, json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,3 +32,35 @@ def test_ws_template_is_copied_without_overwriting(tmp_path):
     assert (ws / 'CLAUDE.md').is_symlink() and (ws / 'AGENTS.md').is_symlink()
     assert (ws / 'NOW.md').is_file()
 
+
+
+def test_herdr_session_dir_is_local_and_layout_state_round_trips(tmp_path, monkeypatch):
+    home, run = tmp_path / 'home', tmp_path / 'run'
+    monkeypatch.setattr(sup, 'HOME', home)
+    monkeypatch.setattr(sup, 'HERDR_LOCAL', run / 'herdr')
+    monkeypatch.setattr(sup, 'HERDR_SAVED', home / '.local/state/herdr-runtime/herdr-session')
+    # an older image kept the whole session (sockets included) on the volume
+    old = home / '.config/herdr/sessions' / sup.SESSION
+    (old / 'session-snapshots').mkdir(parents=True)
+    (old / 'session.json').write_text('{"workspaces": ["assistant"]}')
+    (old / 'session-snapshots/s1.json').write_text('{}')
+    (old / 'herdr.sock').write_text('')
+    local = sup.prepare_herdr_session()
+    link = home / '.config/herdr/sessions'
+    assert link.is_symlink() and (link / sup.SESSION).resolve() == local.resolve() and str(local).startswith(str(run))
+    assert (local / 'session.json').read_text() == '{"workspaces": ["assistant"]}'
+    assert not (local / 'herdr.sock').exists()
+    assert (home / '.config/herdr/.plugins.lock').is_symlink()
+
+    (local / 'session.json').write_text('{"workspaces": ["assistant", "more"]}')
+    sup.save_herdr_state(local)
+    (local / 'session.json').write_text('{"half-writ')          # mid-write: must not replace the saved copy
+    sup.save_herdr_state(local)
+    saved = home / '.local/state/herdr-runtime/herdr-session/session.json'
+    assert json.loads(saved.read_text()) == {'workspaces': ['assistant', 'more']}
+
+    import shutil
+    shutil.rmtree(run)                                       # Pod restart: emptyDir is gone, the volume is not
+    local = sup.prepare_herdr_session()
+    assert json.loads((local / 'session.json').read_text()) == {'workspaces': ['assistant', 'more']}
+    assert (local / 'session-snapshots/s1.json').is_file()
