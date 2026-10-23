@@ -1,7 +1,7 @@
 # assistant ws（herdr runtime Pod）
 
 本文件由镜像 `herdr-runtime-image` 首次启动时放进 PVC，之后归本 Pod 所有，可以改；镜像升级不会覆盖它。
-通用纪律见 skill `workspace` 和 `herdr-workers`（`~/.claude/skills/`，源文件 `/opt/herdr-runtime/skills/`）；
+通用纪律见 skill `workspace` 和 `herdr-workers`（`~/.agents/skills/` / `~/.claude/skills/`，来源是公开仓库 mouse9527/skills）；
 本文件只写本 Pod 的参数和与通用规则不同的地方（回答 workspace skill §2 的七问）。
 
 ## 1. 这是什么 ws
