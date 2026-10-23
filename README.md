@@ -7,6 +7,11 @@ Container image for a single-user [herdr](https://github.com/herdrdev/herdr) age
 - a **task bridge** that hands delegated tasks to long-lived per-topic herdr "lead" agents and reports each task's
   progress over a small REST API;
 - `sshd` on port 2222 (non-root, public key only) so the owner can attach with `herdr machine add`.
+- `phone-holder` + a `codex` wrapper (k8s#87): agents that share one phone through its lease gateway identify themselves
+  with an `x-phone-holder` header. `phone-holder` prints `PHONE_HOLDER` > `herdr:<host>:<session>:<pane>` > `pid:<host>:<pid>`
+  (Claude Code `headersHelper: phone-holder`, pi `!phone-holder --value`); the wrapper exports `PHONE_HOLDER` for
+  codex, whose MCP config can only read headers from env vars. Sub-processes inherit the value, so sub-agents count as
+  the same user of the phone.
 
 There is no compiler toolchain, Docker, kubectl or helm in the image, and no credential of any kind. Building and testing
 code is left to each repository's CI; agents in the Pod edit code, push branches and open pull requests.

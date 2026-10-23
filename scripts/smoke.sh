@@ -198,6 +198,20 @@ ex herdr --session assistant workspace list | jq -e '.result.workspaces[] | sele
 [ -z "$(ex find /home/agent -xdev -type s)" ] || fail "socket on the home volume after restart"
 ok "after restart: same host key, herdr layout restored, ledger kept, in-flight task interrupted (not re-run)"
 
+# 8b. Phone holder (k8s#87): phone-holder resolves PHONE_HOLDER > herdr pane > host + pid; the codex wrapper exports it
+h=$(ex uname -n)
+[ "$(docker exec -e HERDR_SESSION=assistant -e HERDR_PANE_ID=w1:p1 "$NAME" phone-holder --value)" = "herdr:$h:assistant:w1:p1" ] \
+  || fail "phone-holder: herdr pane id"
+docker exec -e HERDR_PANE_ID=w1:p1 "$NAME" phone-holder | jq -e '."x-phone-holder" | startswith("herdr:")' >/dev/null \
+  || fail "phone-holder: headersHelper JSON"
+[ "$(docker exec -e PHONE_HOLDER=keep -e HERDR_PANE_ID=w1:p1 "$NAME" phone-holder --value)" = keep ] || fail "phone-holder: PHONE_HOLDER wins"
+ex sh -c 'unset HERDR_PANE_ID PHONE_HOLDER; phone-holder --value' | grep -q "^pid:$h:" || fail "phone-holder: pid fallback"
+[ "$(ex sh -c 'command -v codex')" = /opt/herdr-runtime/bin/codex ] || fail "codex wrapper not first on PATH"
+docker exec -e HERDR_PANE_ID=w1:p2 -e HERDR_REAL_CODEX=/usr/bin/env "$NAME" codex | grep -qx "PHONE_HOLDER=herdr:$h:assistant:w1:p2" \
+  || fail "codex wrapper: PHONE_HOLDER from the pane"
+ex codex --version >/dev/null || fail "codex through the wrapper"
+ok "phone-holder (pane / PHONE_HOLDER / pid) and the codex wrapper export PHONE_HOLDER"
+
 # 9. No credentials in the image: positive control first, then the whole filesystem (no volume mounted).
 mkdir "$WORK/control"
 python3 -c "print('token=' + 'ghp_' + 'Q' * 36)" > "$WORK/control/planted"
