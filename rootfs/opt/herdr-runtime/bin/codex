@@ -1,0 +1,6 @@
+#!/bin/sh
+# codex wrapper (k8s#87): codex can only take the phone holder header from an env var (env_http_headers), so export
+# PHONE_HOLDER for this codex and everything it starts, then run the real CLI. Earlier on PATH than /usr/local/bin.
+PHONE_HOLDER="${PHONE_HOLDER:-$(phone-holder --value)}"
+export PHONE_HOLDER
+exec "${HERDR_REAL_CODEX:-/usr/local/bin/codex}" "$@"

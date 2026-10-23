@@ -1,0 +1,10 @@
+#!/bin/sh
+# phone-holder: who is using the phone, for the x-phone-holder header of the phone lease gateway (k8s#87).
+#   PHONE_HOLDER (set by a launcher; inherited by sub-processes, so an agent's sub-agents are the same user)
+#   > this herdr pane (HERDR_SESSION / HERDR_PANE_ID, also inherited) > this host + the calling agent's pid
+#   phone-holder          -> {"x-phone-holder":"…"}   (Claude Code MCP headersHelper)
+#   phone-holder --value  -> …                        (pi "!phone-holder --value", the codex wrapper)
+id="${PHONE_HOLDER:-}"
+if [ -z "$id" ] && [ -n "${HERDR_PANE_ID:-}" ]; then id="herdr:$(uname -n):${HERDR_SESSION:-}:${HERDR_PANE_ID}"; fi
+if [ -z "$id" ]; then id="pid:$(uname -n):$PPID"; fi
+if [ "${1:-}" = "--value" ]; then printf '%s' "$id"; else printf '{"x-phone-holder":"%s"}' "$id"; fi
