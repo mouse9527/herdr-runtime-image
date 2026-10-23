@@ -48,13 +48,12 @@ Clients that attach with `herdr machine add` must run a herdr version compatible
   bin/task-ask                  lets a lead ask the human a question through the bridge
   bridge/herdr_bridge.py        task bridge
   etc/                          herdr config, sshd config template
-  skills/                       `workspace` and `herdr-workers` agent skills
   templates/                    workspace skeleton, lead task brief, global agent guide
   cli/                          the npm CLIs
   VERSIONS                      what this image contains
 /home/agent                    the user's volume (NFS PV in the cluster); UID/GID 10001
   workspaces/assistant/         workspace: README.md, repos/, topics/<topic>/{TOPIC.md,NOTES.md,tasks/<task-id>/}
-  .claude/ .claude.json .codex/ .pi/   CLI logins and settings; skills and the global guide are linked from /opt
+  .claude/ .claude.json .codex/ .pi/   CLI logins and settings; the global guide is linked from /opt; skills are linked from ~/.local/share/agent-skills
   .config/gh/                   gh login (hosts.yml), written by `gh auth login --with-token` inside the Pod
   .config/herdr/sessions  ->    symlink to /tmp/herdr-runtime/herdr/sessions (sockets stay on local disk)
   .local/state/herdr-runtime/herdr-session/  herdr layout state (session.json, snapshots), synced from /tmp
@@ -70,7 +69,7 @@ layout changes). The bridge ledger uses SQLite's rollback journal (`journal_mode
 bridge as the only writer, which relies on NFS v4 byte-range locks. Run one Pod per volume.
 
 On every start the supervisor creates missing directories, copies missing workspace files (never overwriting
-existing ones), links the skills, installs herdr's agent-state hooks for claude/codex/pi, and generates the SSH host
+existing ones), starts the skills projector (mouse9527/skills → ~/.agents/skills, ~/.claude/skills; groups from `SKILLS_GROUPS`, default `dev`), installs herdr's agent-state hooks for claude/codex/pi, and generates the SSH host
 key if there is none.
 
 ## Running

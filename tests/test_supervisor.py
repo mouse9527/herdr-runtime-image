@@ -64,3 +64,27 @@ def test_herdr_session_dir_is_local_and_layout_state_round_trips(tmp_path, monke
     local = sup.prepare_herdr_session()
     assert json.loads((local / 'session.json').read_text()) == {'workspaces': ['assistant', 'more']}
     assert (local / 'session-snapshots/s1.json').is_file()
+
+
+def test_baked_skill_links_are_retired_and_nothing_else(tmp_path, monkeypatch):
+    # k8s#75: skills come from mouse9527/skills via bin/skills-project; links to the old baked copies go away
+    monkeypatch.setattr(sup, 'HOME', tmp_path)
+    for root in ('.claude/skills', '.codex/skills', '.pi/agent/skills'):
+        d = tmp_path / root
+        d.mkdir(parents=True)
+        (d / 'workspace').symlink_to('/opt/herdr-runtime/skills/workspace')
+        (d / 'mine').symlink_to('/somewhere/else')
+    (tmp_path / '.codex/skills/.system').mkdir()
+    sup.retire_baked_skill_links()
+    for root in ('.claude/skills', '.codex/skills', '.pi/agent/skills'):
+        assert sorted(p.name for p in (tmp_path / root).iterdir() if not p.name.startswith('.')) == ['mine']
+    assert (tmp_path / '.codex/skills/.system').is_dir()
+
+
+def test_skills_child_links_both_client_dirs(monkeypatch):
+    monkeypatch.setenv('SKILLS_GROUPS', 'dev,assistant')
+    argv = sup.skills_child().argv
+    assert argv[1].endswith('bin/skills-project') and argv[2] == 'release'
+    assert argv[argv.index('--groups') + 1] == 'dev,assistant'
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == '--link'] == [str(d) for d in sup.SKILL_DIRS]
+    assert (OPT / 'bin/skills-project').stat().st_mode & 0o111
