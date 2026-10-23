@@ -168,8 +168,14 @@ ok "herdr, claude, codex, pi report the labelled versions; gh runs"
 
 # 7. Volume layout and ledger storage.
 ex test -f /home/agent/workspaces/assistant/README.md || fail "ws README missing"
-ex test -f /home/agent/.claude/skills/workspace/SKILL.md || fail "workspace skill link missing"
-ex test -f /home/agent/.claude/skills/herdr-workers/SKILL.md || fail "herdr-workers skill link missing"
+# skills: projected from the public mouse9527/skills (network) by the supervisor's `skills` child
+for i in $(seq 90); do ex test -f /home/agent/.agents/skills/herdr-workers/SKILL.md && break; sleep 1; done
+for d in .agents .claude; do
+  for s in workspace herdr-workers; do
+    ex test -f "/home/agent/$d/skills/$s/SKILL.md" || fail "$s skill link missing in ~/$d/skills"
+  done
+done
+ex test ! -e /home/agent/.codex/skills/workspace || fail "old baked skill link still in ~/.codex/skills"
 ex python3 -c "import sqlite3,sys; sys.exit(sqlite3.connect('/home/agent/.local/state/herdr-bridge/ledger.sqlite3').execute('pragma journal_mode').fetchone()[0] != 'delete')" \
   || fail "ledger journal_mode is not delete"
 ex test ! -e /home/agent/.local/state/herdr-bridge/ledger.sqlite3-wal || fail "ledger has a WAL file"

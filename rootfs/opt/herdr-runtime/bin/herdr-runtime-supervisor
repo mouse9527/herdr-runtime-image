@@ -2,7 +2,14 @@
 """Process supervisor for the herdr runtime container (runs as tini's child).
 
 Start order: prepare $HOME (the PVC) -> `herdr --session assistant server` (wait for `api snapshot`) -> task bridge
--> sshd (non-root, :2222, public key only). A child that exits is restarted with backoff; if herdr exits, the bridge
+-> sshd (non-root, :2222, public key only) -> skills.
+
+Skills (k8s#75): the single source is the public repository mouse9527/skills. The `skills` child runs its projector
+(bin/skills-project, vendored): every 5 min `main` -> full commit SHA -> immutable release of $SKILLS_GROUPS under
+~/.local/share/agent-skills (current switched atomically; a failed fetch keeps the current one), and leaf links
+~/.agents/skills/<id> (Codex, Pi) and ~/.claude/skills/<id> (Claude Code) -> current. It only ever touches links it
+created; a user's own entry with the same name is left alone (and logged). Links to the skills that used to be baked
+into this image (/opt/herdr-runtime/skills/…) are removed at start. A child that exits is restarted with backoff; if herdr exits, the bridge
 is stopped and started again after herdr is back (its startup recovery reports lost executions as interrupted).
 SIGTERM: stop the bridge (no new tasks), `herdr server stop` (lets herdr save its layout), stop sshd, exit.
 
@@ -14,6 +21,7 @@ saved every minute and after a clean stop. A hard kill can lose up to a minute o
 
 Environment:
   HERDR_SESSION (assistant)  BRIDGE_DISABLED=1  SSH_DISABLED=1  SSH_PORT (2222)
+  SKILLS_GROUPS (dev)  SKILLS_REPO (mouse9527/skills)  SKILLS_REF (main, or a full SHA to pin)  SKILLS_DISABLED=1
   SSH_AUTHORIZED_KEYS (/etc/herdr-runtime/ssh/authorized_keys; mount it read-only, the agent must not edit it)
 """
 import json, os, shutil, signal, subprocess, sys, time
@@ -31,6 +39,9 @@ SSH_ENV = ('PATH', 'HERDR_CONFIG_PATH', 'HERDR_SESSION', 'WS_ROOT', 'DISABLE_AUT
 HERDR_LOCAL = RUN / 'herdr'                      # sockets, lock, live session dir (local disk)
 HERDR_SAVED = STATE / 'herdr-session'           # layout state copy (volume)
 SAVE_SECONDS = 60
+SKILLS_ROOT = HOME / '.local/share/agent-skills'
+SKILL_DIRS = (HOME / '.agents/skills', HOME / '.claude/skills')    # Codex + Pi read the first, Claude Code the second
+BAKED_SKILLS = '/opt/herdr-runtime/skills/'                          # before k8s#75
 stopping = False
 
 
@@ -123,14 +134,33 @@ def prepare_herdr_session():
     return local
 
 
+def retire_baked_skill_links():
+    """Remove the links earlier images made to their baked-in skills (the projector links the repository's now)."""
+    for root in ('.claude/skills', '.codex/skills', '.pi/agent/skills'):
+        d = HOME / root
+        for p in sorted(d.iterdir()) if d.is_dir() else []:
+            if p.is_symlink() and os.readlink(p).startswith(BAKED_SKILLS):
+                p.unlink()
+                log('removed old skill link', p)
+
+
+def skills_child():
+    argv = [sys.executable, str(OPT / 'bin/skills-project'), 'release',
+            '--github', os.environ.get('SKILLS_REPO', 'mouse9527/skills'), '--ref', os.environ.get('SKILLS_REF', 'main'),
+            '--groups', os.environ.get('SKILLS_GROUPS', 'dev'), '--root', str(SKILLS_ROOT), '--loop', '300']
+    for d in SKILL_DIRS:
+        argv += ['--link', str(d)]
+    return Child('skills', argv)
+
+
 def prepare_home():
     for d in (STATE / 'ssh', HOME / '.claude', HOME / '.codex', HOME / '.pi/agent', WS / 'repos', WS / 'topics', RUN):
         d.mkdir(parents=True, exist_ok=True)
     os.chmod(STATE / 'ssh', 0o700)
     copy_missing(OPT / 'templates/ws', WS)
-    for skill in sorted((OPT / 'skills').iterdir()):
-        for root in ('.claude/skills', '.codex/skills', '.pi/agent/skills'):
-            link(skill, HOME / root / skill.name)
+    retire_baked_skill_links()
+    for d in (SKILLS_ROOT, *SKILL_DIRS):
+        d.mkdir(parents=True, exist_ok=True)
     guide = OPT / 'templates/agent-guide.md'
     for path in (HOME / '.claude/CLAUDE.md', HOME / '.codex/AGENTS.md', HOME / '.pi/agent/AGENTS.md'):
         link(guide, path)
@@ -219,6 +249,8 @@ def main():
         others.append(Child('bridge', [sys.executable, str(OPT / 'bridge/herdr_bridge.py')]))
     if os.environ.get('SSH_DISABLED') != '1':
         others.append(Child('sshd', ['/usr/sbin/sshd', '-D', '-e', '-f', str(sshd_config())]))
+    if os.environ.get('SKILLS_DISABLED') != '1':
+        others.append(skills_child())
 
     def on_signal(signum, _):
         global stopping
