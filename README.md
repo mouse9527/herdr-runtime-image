@@ -140,6 +140,15 @@ at 64 KB with `truncated: true` and the real `size`; a file with NUL bytes comes
 The path is in a POST body because the router only admits `[A-Za-z0-9_:/-]` in REST paths. The completion event
 carries the first 2500 characters of the report after its status line.
 
+**LiteLLM identity (k8s#64 AC6).** Optional, both mounted by the deployment: the Pod's own LiteLLM key as a file
+(`/etc/herdr-runtime/litellm/api-key`, override `LITELLM_KEY_FILE`) and the CLI MCP configs compiled by assistant-config
+(`/etc/herdr-runtime/mcp/{claude.mcp.json,codex.mcp.toml,pi.mcp.json}`, override `MCP_CONFIG_DIR`). The supervisor exports
+the key as `LITELLM_API_KEY` and `ANTHROPIC_AUTH_TOKEN` to everything it starts (SSH login shells read the same file via
+`/etc/profile.d/herdr-litellm.sh`; it is never put in the sshd config), and merges the compiled MCP servers into
+`~/.claude.json`, `~/.codex/config.toml` and `~/.pi/agent/mcp.json` at every start, leaving every other server and setting
+alone. The bridge also answers MCP at `POST /mcp` (tool `bridge_request` = one REST request, returns `{status, body}`) so
+the OWUI plugins can call it through the LiteLLM gateway with the user's own identity; same identity rule as REST.
+
 **Identity.** The only identity is the `x-mcp-router-sub` header, which must be in `ALLOWED_SUBS`. It is trustworthy
 only because the router in front verified a signed token and overwrote the header, and NetworkPolicy lets nothing else
 reach port 8080. Never expose 8080 any other way.

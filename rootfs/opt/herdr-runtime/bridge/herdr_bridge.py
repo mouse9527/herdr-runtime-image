@@ -11,6 +11,11 @@ REST API on :8080 (client: the Open WebUI event plugin herdr_event; 1.1.4 reques
   POST /tasks/{id}/read        {path?='REPORT.md'} -> {path, size, truncated, binary, content}  first 64 KB of one file
                                (read-only; the path is in the body because the router admits only [A-Za-z0-9_:/-] paths)
   GET  /healthz /readyz
+  POST /mcp                    the same API as one MCP tool (k8s#64 AC6, below)
+MCP (Streamable HTTP, JSON responses, stateless): tool `bridge_request` {method: GET|POST, path, body?} runs exactly
+the REST request above and returns {status, body}. The OWUI plugins reach it through the LiteLLM MCP gateway with the
+user's own LiteLLM identity (the gateway signs the caller; the router verifies it and sets the header below), so no
+client has to sign identities itself. Same identity rule as REST.
 Identity: the only trusted identity is the `x-mcp-router-sub` header set by the router after it verified the user's
 signed token; it must be in ALLOWED_SUBS. Safe only while NetworkPolicy lets nothing but that router reach the port.
 
@@ -941,7 +946,80 @@ class Handler(BaseHTTPRequestHandler):
         self.send(code, data)
 
 
+MCP_PROTOCOLS = ('2025-06-18', '2025-03-26', '2024-11-05')
+MCP_TOOL = {
+    'name': 'bridge_request',
+    'description': 'Run one request of the herdr task bridge REST API as the calling user; returns {status, body}.',
+    'inputSchema': {
+        'type': 'object', 'required': ['method', 'path'],
+        'properties': {
+            'method': {'type': 'string', 'enum': ['GET', 'POST']},
+            'path': {'type': 'string', 'description': 'REST path, e.g. /tasks or /tasks/{id}/events'},
+            'body': {'type': 'object', 'description': 'JSON body of a POST'},
+        },
+    },
+}
+
+
 class Api(Handler):
+    def mcp(self, msg):
+        """One JSON-RPC message -> (http code, response or None). Identity was checked by route() already."""
+        if not isinstance(msg, dict) or msg.get('jsonrpc') != '2.0' or not isinstance(msg.get('method'), str):
+            return 400, {'jsonrpc': '2.0', 'id': None, 'error': {'code': -32600, 'message': 'invalid request'}}
+        mid, method, params = msg.get('id'), msg['method'], msg.get('params') or {}
+        if mid is None:  # notification
+            return 202, None
+        def ok(result):
+            return 200, {'jsonrpc': '2.0', 'id': mid, 'result': result}
+        def err(code, text):
+            return 200, {'jsonrpc': '2.0', 'id': mid, 'error': {'code': code, 'message': text}}
+        if method == 'initialize':
+            want = params.get('protocolVersion')
+            return ok({'protocolVersion': want if want in MCP_PROTOCOLS else MCP_PROTOCOLS[0],
+                       'capabilities': {'tools': {'listChanged': False}},
+                       'serverInfo': {'name': 'herdr-bridge', 'version': '1'}})
+        if method == 'ping':
+            return ok({})
+        if method == 'tools/list':
+            return ok({'tools': [MCP_TOOL]})
+        if method != 'tools/call':
+            return err(-32601, 'method not found')
+        if params.get('name') != MCP_TOOL['name']:
+            return err(-32602, 'unknown tool')
+        a = params.get('arguments') or {}
+        rest_method, path, body = a.get('method'), a.get('path'), a.get('body') or {}
+        if rest_method not in ('GET', 'POST') or not isinstance(path, str) or not path.startswith('/') \
+                or not isinstance(body, dict) or path.split('?')[0] in ('/mcp', '/healthz', '/readyz'):
+            return err(-32602, 'invalid arguments')
+        code, data = self.route(rest_method, path.split('?')[0], body if rest_method == 'POST' else {})
+        result = {'status': code, 'body': data}
+        return ok({'content': [{'type': 'text', 'text': json.dumps(result, ensure_ascii=False)}],
+                   'structuredContent': result, 'isError': False})
+
+    def dispatch(self, method):
+        if self.path.split('?')[0] != '/mcp':
+            return super().dispatch(method)
+        if method != 'POST':
+            return self.send(405, {'error': 'method'})
+        sub = self.headers.get(SUB_HEADER, '')
+        if sub not in self.bridge.cfg.allowed:
+            log('deny', 'MCP', 'sub_present=' + str(bool(sub)))
+            return self.send(403, {'error': 'identity'})
+        try:
+            msg = self.body()
+        except ValueError:
+            return self.send(400, {'jsonrpc': '2.0', 'id': None, 'error': {'code': -32700, 'message': 'parse error'}})
+        try:
+            code, data = self.mcp(msg)
+        except Exception as e:
+            log('error', 'MCP', type(e).__name__, e)
+            code, data = 200, {'jsonrpc': '2.0', 'id': msg.get('id'), 'error': {'code': -32603, 'message': 'internal'}}
+        if data is None:
+            self.send_response(code)
+            self.send_header('Content-Length', '0')
+            return self.end_headers()
+        self.send(code, data)
+
     def route(self, method, path, body):
         b = self.bridge
         if path == '/healthz' and method == 'GET':

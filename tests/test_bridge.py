@@ -571,3 +571,51 @@ def test_ledger_uses_a_rollback_journal_not_wal(tmp_path):
     path = b.cfg.state_dir / 'ledger.sqlite3'
     assert sqlite3.connect(str(path)).execute('PRAGMA journal_mode').fetchone()[0] == 'delete'
     assert not Path(str(path) + '-wal').exists()
+
+
+# ---- MCP entry (k8s#64 AC6): the REST API as one tool, same identity rule ----
+
+def test_mcp_entry_runs_the_rest_api_with_the_router_identity(tmp_path):
+    b = make(tmp_path)
+    server = hb.serve(b)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = 'http://127.0.0.1:%d/mcp' % server.server_address[1]
+
+    def rpc(msg, sub=ALICE):
+        req = urllib.request.Request(base, data=json.dumps(msg).encode(), method='POST',
+                                     headers={'Content-Type': 'application/json', **({hb.SUB_HEADER: sub} if sub else {})})
+        try:
+            with urllib.request.urlopen(req) as r:
+                raw = r.read()
+                return r.status, json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            return e.code, None
+
+    def call(args, sub=ALICE):
+        code, data = rpc({'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call',
+                          'params': {'name': 'bridge_request', 'arguments': args}}, sub)
+        assert code == 200, (code, data)
+        return data
+    try:
+        assert rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2025-06-18'}}, None)[0] == 403
+        assert rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'}, 'mallory')[0] == 403
+        code, init = rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2025-06-18'}})
+        assert code == 200 and init['result']['protocolVersion'] == '2025-06-18'
+        assert rpc({'jsonrpc': '2.0', 'method': 'notifications/initialized'}) == (202, None)
+        tools = rpc({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})[1]['result']['tools']
+        assert [t['name'] for t in tools] == ['bridge_request']
+        body = {'id': tid(1), 'generation': 1, 'request_key': 'k1', 'task': '修一个 README 错字'}
+        r = call({'method': 'POST', 'path': '/tasks', 'body': body})['result']
+        assert r['isError'] is False and r['structuredContent']['status'] == 200
+        assert json.loads(r['content'][0]['text']) == r['structuredContent']
+        ev = call({'method': 'GET', 'path': '/tasks/%s/events' % tid(1)})['result']['structuredContent']
+        assert ev['status'] == 200 and plugin_accepts(ev['body'], tid(1), 1) is not None
+        # the identity is the router's, per request: another allowed user does not see alice's task
+        assert call({'method': 'GET', 'path': '/tasks/%s/events' % tid(1)}, 'bob-sub')['result']['structuredContent']['status'] == 404
+        assert call({'method': 'GET', 'path': '/nope'})['result']['structuredContent'] == {'status': 404, 'body': {'error': 'path'}}
+        for bad in ({'method': 'DELETE', 'path': '/tasks'}, {'method': 'GET', 'path': 'tasks'},
+                    {'method': 'POST', 'path': '/mcp', 'body': {}}, {'method': 'GET', 'path': '/healthz'}):
+            assert call(bad)['error']['code'] == -32602
+        assert rpc({'jsonrpc': '2.0', 'id': 4, 'method': 'tools/call', 'params': {'name': 'x', 'arguments': {}}})[1]['error']['code'] == -32602
+    finally:
+        server.shutdown()
