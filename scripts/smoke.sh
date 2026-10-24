@@ -26,8 +26,34 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "ok - $*"; }
 ex() { docker exec "$NAME" "$@"; }
 B=http://127.0.0.1:18080
-code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
-api() { curl -fsS -H 'x-mcp-router-sub: smoke-user' -H 'content-type: application/json' "$@"; }
+# The bridge API is served only through its MCP tool (k8s#64 AC6): `bridge_request` {method, path, body?} -> {status, body}.
+# mcp_req <sub|-> <METHOD> <path> [json body] prints "<status> <body json>"; an identity refusal (HTTP 403) prints "403 null".
+mcp_req() {
+  local sub=$1 m=$2 path=$3 body=${4:-null} msg out hdr=()
+  msg=$(jq -nc --arg m "$m" --arg p "$path" --argjson b "$body" \
+    '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"bridge_request",arguments:({method:$m,path:$p}+(if $b==null then {} else {body:$b} end))}}')
+  [ "$sub" = - ] || hdr=(-H "x-mcp-router-sub: $sub")
+  out=$(curl -s -w '\n%{http_code}' ${hdr[@]+"${hdr[@]}"} -H 'content-type: application/json' -d "$msg" "$B/mcp")
+  [ "$(echo "$out" | tail -n1)" = 200 ] || { echo "$(echo "$out" | tail -n1) null"; return; }
+  echo "$out" | sed '$d' | jq -c '"\(.result.structuredContent.status) \(.result.structuredContent.body | tojson)"' -r
+}
+# code [-H 'x-mcp-router-sub: X'] [-d BODY] URL -> status (healthz / readyz stay plain HTTP)
+code() {
+  local sub=- body='' url
+  while [ $# -gt 1 ]; do case $1 in -H) sub=${2#x-mcp-router-sub: }; shift 2 ;; -d) body=$2; shift 2 ;; *) shift ;; esac; done
+  url=$1
+  case $url in */healthz|*/readyz) curl -s -o /dev/null -w '%{http_code}' "$url"; return ;; esac
+  mcp_req "$sub" "$([ -n "$body" ] && echo POST || echo GET)" "${url#$B}" "${body:-null}" | cut -d' ' -f1
+}
+# api [-d BODY] URL -> response body as smoke-user; fails (like curl -f) on a status >= 300
+api() {
+  local body='' url r
+  [ "$1" = -d ] && { body=$2; shift 2; }
+  url=$1
+  r=$(mcp_req smoke-user "$([ -n "$body" ] && echo POST || echo GET)" "${url#$B}" "${body:-null}")
+  [ "${r%% *}" -lt 300 ] || return 22
+  echo "${r#* }"
+}
 wait_for() {  # wait_for <seconds> <description> <command...>
   local n=$1 what=$2; shift 2
   for _ in $(seq 1 "$n"); do "$@" >/dev/null 2>&1 && return 0; sleep 1; done
@@ -107,14 +133,16 @@ ok "one topic lead ($lead) started via herdr agent start, all three task briefs 
 
 ex sh -c "printf 'STATUS: done\nsmoke result 2\n' > '$(tdir "${ids[1]}")/REPORT.md'"
 ex sh -c "printf 'STATUS: blocked（需要用户决定：A 还是 B）\n' > '$(tdir "${ids[2]}")/REPORT.md'"
-wait_for 30 "task 2 completed" sh -c "[ \"\$(curl -s -H 'x-mcp-router-sub: smoke-user' $B/tasks/${ids[1]}/events | jq -r .state)\" = completed ]"
-wait_for 30 "task 3 blocked" sh -c "[ \"\$(curl -s -H 'x-mcp-router-sub: smoke-user' $B/tasks/${ids[2]}/events | jq -r .state)\" = blocked ]"
+for _ in $(seq 30); do [ "$(state "${ids[1]}")" = completed ] && break; sleep 1; done; [ "$(state "${ids[1]}")" = completed ] || fail "timed out: task 2 completed"
+for _ in $(seq 30); do [ "$(state "${ids[2]}")" = blocked ] && break; sleep 1; done; [ "$(state "${ids[2]}")" = blocked ] || fail "timed out: task 3 blocked"
 [ "$(state "${ids[0]}")" = running ] || fail "task 1 must still be running"
 q=$(api "$B/tasks/${ids[2]}/events" | jq -c .question)
 api -d "{\"question_id\":$(echo "$q" | jq .id),\"version\":$(echo "$q" | jq .version),\"answer\":\"B\",\"request_key\":\"r1\"}" \
   "$B/tasks/${ids[2]}/reply" | jq -e '.status == "answered"' >/dev/null || fail "reply"
 wait_for 20 "answer file" ex test -f "$(tdir "${ids[2]}")/answers/q1.md"
 [ "$(state "${ids[2]}")" = running ] || fail "task 3 should be running after the answer"
+[ "$(code -H 'x-mcp-router-sub: smoke-user' $B/tasks)" = 200 ] && [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'x-mcp-router-sub: smoke-user' $B/tasks)" = 404 ] \
+  || fail "REST paths must be closed on the port (MCP only, k8s#64 AC6)"
 ok "tasks finish independently (completed / blocked -> answered -> running / running) while the lead stays the same"
 
 # Read-only file access on the real filesystem (home on NFS in CI).
