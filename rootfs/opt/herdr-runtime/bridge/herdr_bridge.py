@@ -1,6 +1,7 @@
 """herdr task bridge: hands delegated tasks to topic leads in herdr and reports each task's progress.
 
-REST API on :8080 (client: the Open WebUI event plugin herdr_event; 1.1.4 requests still work unchanged):
+The API below is served ONLY through the MCP tool `bridge_request` (POST /mcp) since k8s#64 AC6; on :8080 the REST paths
+themselves answer 404 (only /healthz, /readyz and /mcp are open). Requests (client: the Open WebUI event plugin):
   POST /tasks                  {id, generation, request_key, task, topic?, parent_chat_id?}  create or return the same
   GET  /tasks/{id}/events      {state, question, events[<=64], topic}
   POST /tasks/{id}/reply       {question_id, version, answer, request_key}   receipt first, then 409 when stale
@@ -11,7 +12,7 @@ REST API on :8080 (client: the Open WebUI event plugin herdr_event; 1.1.4 reques
   POST /tasks/{id}/read        {path?='REPORT.md'} -> {path, size, truncated, binary, content}  first 64 KB of one file
                                (read-only; the path is in the body because the router admits only [A-Za-z0-9_:/-] paths)
   GET  /healthz /readyz
-  POST /mcp                    the same API as one MCP tool (k8s#64 AC6, below)
+  POST /mcp                    the API above as one MCP tool (k8s#64 AC6, below)
 MCP (Streamable HTTP, JSON responses, stateless): tool `bridge_request` {method: GET|POST, path, body?} runs exactly
 the REST request above and returns {status, body}. The OWUI plugins reach it through the LiteLLM MCP gateway with the
 user's own LiteLLM identity (the gateway signs the caller; the router verifies it and sets the header below), so no
@@ -997,8 +998,12 @@ class Api(Handler):
                    'structuredContent': result, 'isError': False})
 
     def dispatch(self, method):
-        if self.path.split('?')[0] != '/mcp':
+        path = self.path.split('?')[0]
+        if path in ('/healthz', '/readyz'):
             return super().dispatch(method)
+        if path != '/mcp':
+            # k8s#64 AC6: the REST paths are served only through the MCP tool (the router no longer has a REST route)
+            return self.send(404, {'error': 'path'})
         if method != 'POST':
             return self.send(405, {'error': 'method'})
         sub = self.headers.get(SUB_HEADER, '')

@@ -121,7 +121,9 @@ screens; the bridge then sees no work start and asks for a takeover instead of t
 
 ## Task bridge
 
-REST API on `:8080` (the client is an Open WebUI event plugin; requests without `topic`/`parent_chat_id` still work):
+Bridge API (the client is an Open WebUI event plugin; requests without `topic`/`parent_chat_id` still work). Since k8s#64
+AC6 it is reachable only through the MCP tool `bridge_request` at `POST /mcp` (one call = one request below, result
+`{status, body}`); on `:8080` the REST paths answer 404:
 
 | Request | Result |
 |---|---|
