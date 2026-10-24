@@ -24,7 +24,7 @@ Environment:
   SKILLS_GROUPS (dev)  SKILLS_REPO (mouse9527/skills)  SKILLS_REF (main, or a full SHA to pin)  SKILLS_DISABLED=1
   SSH_AUTHORIZED_KEYS (/etc/herdr-runtime/ssh/authorized_keys; mount it read-only, the agent must not edit it)
 """
-import json, os, shutil, signal, subprocess, sys, time
+import json, os, shutil, signal, stat, subprocess, sys, time
 from pathlib import Path
 
 OPT = Path('/opt/herdr-runtime')
@@ -42,6 +42,10 @@ SAVE_SECONDS = 60
 SKILLS_ROOT = HOME / '.local/share/agent-skills'
 SKILL_DIRS = (HOME / '.agents/skills', HOME / '.claude/skills')    # Codex + Pi read the first, Claude Code the second
 BAKED_SKILLS = '/opt/herdr-runtime/skills/'                          # before k8s#75
+# k8s#64 AC6: the Pod's own LiteLLM key (a mounted Secret file, never an env var of the Pod spec or the sshd config) and
+# the CLI MCP configs compiled by assistant-config (a mounted ConfigMap). Both optional: absent -> nothing changes.
+GATEWAY_KEY_FILE = Path(os.environ.get('LITELLM_KEY_FILE', '/etc/herdr-runtime/litellm/api-key'))
+MCP_CONFIG_DIR = Path(os.environ.get('MCP_CONFIG_DIR', '/etc/herdr-runtime/mcp'))
 stopping = False
 
 
@@ -177,6 +181,81 @@ def prepare_home():
         log('herdr integration install', kind, 'rc=%d' % r.returncode, (r.stdout + r.stderr).strip()[:200])
 
 
+def load_gateway_key():
+    """Export the gateway key to every child (herdr panes and their CLIs inherit it): LITELLM_API_KEY for MCP / codex /
+    pi, ANTHROPIC_AUTH_TOKEN for Claude Code. SSH login shells read the same file (/etc/profile.d/herdr-litellm.sh)."""
+    try:
+        key = GATEWAY_KEY_FILE.read_text().strip()
+    except OSError:
+        return False
+    if not key or any(c in key for c in '\r\n'):
+        log('gateway key file is empty or not one line, ignored')
+        return False
+    os.environ['LITELLM_API_KEY'] = os.environ['ANTHROPIC_AUTH_TOKEN'] = key
+    return True
+
+
+def _write_atomic(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name('.' + path.name + '.herdr-runtime')
+    tmp.write_text(text)
+    if path.exists():
+        os.chmod(tmp, stat.S_IMODE(path.stat().st_mode))
+    os.replace(tmp, path)
+
+
+def _merge_json_servers(path, servers):
+    """Set the given mcpServers entries in a JSON config; every other key and server stays as it is."""
+    data = json.loads(path.read_text()) if path.exists() and path.read_text().strip() else {}
+    current = data.setdefault('mcpServers', {})
+    if all(current.get(k) == v for k, v in servers.items()):
+        return False
+    current.update(servers)
+    _write_atomic(path, json.dumps(data, indent=2, ensure_ascii=False) + '\n')
+    return True
+
+
+def _merge_toml_tables(path, block):
+    """Replace the TOML tables the block defines ([mcp_servers.<name>] and its sub-tables) in a config file, keep the
+    rest. Text-level on purpose: the block comes from our own compiler and only holds whole tables."""
+    names = {line.strip() for line in block.splitlines() if line.strip().startswith('[')}
+    prefixes = tuple(n[:-1] + '.' for n in names)
+    text = path.read_text() if path.exists() else ''
+    kept, skipping = [], False
+    for line in text.splitlines():
+        head = line.strip()
+        if head.startswith('['):
+            skipping = head in names or head.startswith(prefixes)
+        if not skipping and line != MCP_MARK:
+            kept.append(line)
+    new = '\n'.join(kept).rstrip('\n') + '\n\n' + MCP_MARK + '\n' + block.strip('\n') + '\n'
+    if new == text:
+        return False
+    _write_atomic(path, new)
+    return True
+
+
+MCP_MARK = '# MCP server tables below are written by herdr-runtime from the compiled config (k8s#64 AC6); edits are replaced'
+
+
+def merge_mcp_configs():
+    """assistant-config build/cli-mcp/<subject>/ (mounted) -> each CLI's own config. Only the compiled servers are
+    written; the user's other servers and settings stay."""
+    if not MCP_CONFIG_DIR.is_dir():
+        return
+    for src, dst, kind in ((MCP_CONFIG_DIR / 'claude.mcp.json', HOME / '.claude.json', 'json'),
+                           (MCP_CONFIG_DIR / 'pi.mcp.json', HOME / '.pi/agent/mcp.json', 'json'),
+                           (MCP_CONFIG_DIR / 'codex.mcp.toml', HOME / '.codex/config.toml', 'toml')):
+        if not src.is_file():
+            continue
+        try:
+            changed = (_merge_json_servers(dst, json.loads(src.read_text())['mcpServers']) if kind == 'json'
+                       else _merge_toml_tables(dst, src.read_text()))
+            log('mcp config', dst.name, 'updated' if changed else 'unchanged')
+        except Exception as e:  # a broken file must not keep the Pod from starting
+            log('mcp config', dst.name, 'not merged:', type(e).__name__, e)
+
+
 def sshd_config():
     keys = os.environ.get('SSH_AUTHORIZED_KEYS', '/etc/herdr-runtime/ssh/authorized_keys')
     env = ' '.join('%s="%s"' % (k, os.environ[k]) for k in SSH_ENV if os.environ.get(k))
@@ -238,6 +317,8 @@ class Child:
 def main():
     global stopping
     prepare_home()
+    log('gateway key', 'loaded' if load_gateway_key() else 'absent')
+    merge_mcp_configs()
     session_dir = prepare_herdr_session()
     last_save = time.time()
     # herdr only reports the detached_server_daemon capability (required by `herdr machine add`) when the server is
