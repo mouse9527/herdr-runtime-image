@@ -138,12 +138,10 @@ def test_identity_only_trusts_allow_listed_router_sub(tmp_path):
             return e.code
     try:
         assert status('/healthz') == 200
-        assert status('/tasks') == 403
-        assert status('/tasks', 'mallory') == 403
-        assert status('/topics', 'mallory') == 403
-        assert status('/tasks', ALICE) == 200
-        assert status('/topics', ALICE) == 200
-        assert status('/tasks/%s/events' % tid(9), ALICE) == 404
+        # k8s#64 AC6: the REST paths are closed on the port; the API is served only through POST /mcp
+        for path, sub in (('/tasks', None), ('/tasks', 'mallory'), ('/tasks', ALICE), ('/topics', ALICE),
+                          ('/tasks/%s/events' % tid(9), ALICE)):
+            assert status(path, sub) == 404
     finally:
         server.shutdown()
 
@@ -537,11 +535,15 @@ def test_file_routes_over_http_need_the_owner(tmp_path):
     base = 'http://127.0.0.1:%d' % server.server_address[1]
 
     def call(method, path, sub, body=None):
-        req = urllib.request.Request(base + path, method=method, headers={hb.SUB_HEADER: sub},
-                                     data=json.dumps(body).encode() if body is not None else None)
+        """One API request through the MCP entry (the only way in since k8s#64 AC6) -> (status, body)."""
+        args = {'method': method, 'path': path, **({'body': body} if body is not None else {})}
+        msg = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {'name': 'bridge_request', 'arguments': args}}
+        req = urllib.request.Request(base + '/mcp', method='POST', data=json.dumps(msg).encode(),
+                                     headers={hb.SUB_HEADER: sub, 'Content-Type': 'application/json'})
         try:
             with urllib.request.urlopen(req) as r:
-                return r.status, json.loads(r.read())
+                res = json.loads(r.read())['result']['structuredContent']
+                return res['status'], res['body']
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read())
     try:
